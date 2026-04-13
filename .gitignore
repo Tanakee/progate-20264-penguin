@@ -1,0 +1,27 @@
+# 環境変数・秘密情報（絶対にコミットしない）
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# エディタ
+.vscode/
+.idea/
+*.swp
+
+# LocalStack永続化データ
+localstack-data/

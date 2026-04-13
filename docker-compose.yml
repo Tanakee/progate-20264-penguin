@@ -1,0 +1,96 @@
+services:
+  # ─────────────────────────────────────────────
+  # エッジ処理サービス（MediaPipe / OpenCV / PyAudio）
+  #
+  # [カメラ・マイクについて] macOS / Windows 共通
+  # Docker Desktop は仮想化レイヤーを介するため、カメラ・マイクへの
+  # 直接アクセスができません。
+  # カメラ・マイクを使う本番実行は以下のコマンドでネイティブ実行してください:
+  #   cd edge && pip install -r requirements.txt && python main.py
+  #
+  # このコンテナはロジックの単体テスト・依存関係の確認用として使います。
+  #
+  # [映像表示（DISPLAY）の設定]
+  # OpenCV の imshow 等で画面出力が必要な場合、OS ごとに設定が異なります。
+  # 通常のテストでは不要です（ヘッドレス実行を推奨）。
+  #
+  #   macOS: XQuartz をインストールし `xhost +localhost` を実行後、以下を有効化
+  #     DISPLAY=host.docker.internal:0
+  #
+  #   Windows 10: VcXsrv (https://sourceforge.net/projects/vcxsrv/) をインストールし
+  #     「Disable access control」を有効にして起動後、以下を有効化
+  #     DISPLAY=host.docker.internal:0.0
+  #
+  #   Windows 11: WSL2 + WSLg が自動で GUI をサポートするため DISPLAY 設定は不要。
+  #     ただし Docker Desktop の Backend を WSL2 に設定していること。
+  # ─────────────────────────────────────────────
+  edge:
+    build:
+      context: ./edge
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      # 映像表示が必要な場合のみ、OS に合わせて以下のどちらかをコメントアウト解除
+      # macOS / Windows 10:
+      # - DISPLAY=host.docker.internal:0
+      # Windows 10 (VcXsrv):
+      # - DISPLAY=host.docker.internal:0.0
+    volumes:
+      - ./edge:/app
+      - ./assets:/app/assets:ro   # ペンギンARアセット
+    depends_on:
+      - localstack
+    networks:
+      - penguin-net
+
+  # ─────────────────────────────────────────────
+  # Lambda 関数 ローカル開発サービス
+  # AWS SAM CLI の代替として、依存関係の確認・単体テストに使用します。
+  # ─────────────────────────────────────────────
+  lambda-dev:
+    build:
+      context: ./lambda
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      - AWS_ENDPOINT_URL=http://localstack:4566
+    volumes:
+      - ./lambda:/var/task
+    depends_on:
+      - localstack
+    networks:
+      - penguin-net
+
+  # ─────────────────────────────────────────────
+  # LocalStack（ローカル AWS モック）
+  # 対応サービス: S3, Lambda, AppSync(※制限あり)
+  # Rekognition / Timestream は Pro プランのみ対応のため、
+  # ローカル開発時はスタブ実装で代替します（edge/stubs/ 参照）。
+  # ─────────────────────────────────────────────
+  localstack:
+    image: localstack/localstack:3
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=s3,lambda,events,iam
+      - DEBUG=0
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-ap-northeast-1}
+    volumes:
+      - localstack-data:/var/lib/localstack
+      - ./infra/localstack-init:/etc/localstack/init/ready.d:ro  # 初期化スクリプト
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - penguin-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  penguin-net:
+    driver: bridge
+
+volumes:
+  localstack-data:

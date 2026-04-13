@@ -1,0 +1,24 @@
+# Windows環境でcloneした際に改行コードがCRLFになるのを防ぐ設定
+# シェルスクリプトがCRLFになるとLinuxコンテナ内で実行エラーになるため必須
+
+# デフォルト: テキストファイルはOSの改行コードに自動変換
+* text=auto
+
+# シェルスクリプト: 常にLFを強制（Windowsでもコンテナ内でそのまま実行されるため）
+*.sh text eol=lf
+
+# Dockerfile / docker-compose: 常にLF
+Dockerfile text eol=lf
+docker-compose*.yml text eol=lf
+.env* text eol=lf
+requirements*.txt text eol=lf
+
+# Pythonソース: 自動変換に委ねる（ローカル編集はOSに合わせてよい）
+*.py text=auto
+
+# バイナリファイル: 変換しない
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.zip binary

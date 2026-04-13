@@ -1,0 +1,38 @@
+# 環境変数・秘密情報
+.env
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# エディタ
+.vscode/
+.idea/
+*.swp
+
+# Git
+.git/
+.gitignore
+
+# ドキュメント
+*.md
+要件定義書.md
+
+# ログ・一時ファイル
+*.log
+tmp/
