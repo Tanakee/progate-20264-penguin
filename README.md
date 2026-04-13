@@ -19,7 +19,7 @@ cd progate-20264-penguin
 cp .env.example .env
 ```
 
-`.env` を開き、Slackで共有された実際の値を入力してください。
+`.env` を開き、Discordで共有された実際の値を入力してください。
 **`.env` は絶対にコミットしないでください。**
 
 ### 3. Docker環境を起動（LocalStack / Lambda開発用）
