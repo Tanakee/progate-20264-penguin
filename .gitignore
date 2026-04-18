@@ -25,3 +25,6 @@ Thumbs.db
 
 # LocalStack永続化データ
 localstack-data/
+
+# YOLOモデルファイル（自動ダウンロードされるため除外）
+*.pt

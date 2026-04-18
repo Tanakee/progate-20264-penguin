@@ -16,88 +16,18 @@ from pathlib import Path
 
 import boto3
 import cv2
-import mediapipe as mp
-import numpy as np
 from dotenv import load_dotenv
 
 from ar_overlay import AROverlay
 from clap_detector import ClapDetector
-from face_tracker import FaceTracker
+from face_tracker import FaceTracker, draw_debug
 
-# Pose で描画対象にする腕・手首ランドマーク
-_POSE_ARM_LANDMARKS = [
-    mp.solutions.pose.PoseLandmark.LEFT_SHOULDER,
-    mp.solutions.pose.PoseLandmark.RIGHT_SHOULDER,
-    mp.solutions.pose.PoseLandmark.LEFT_ELBOW,
-    mp.solutions.pose.PoseLandmark.RIGHT_ELBOW,
-    mp.solutions.pose.PoseLandmark.LEFT_WRIST,
-    mp.solutions.pose.PoseLandmark.RIGHT_WRIST,
-]
-_POSE_ARM_CONNECTIONS = [
-    (mp.solutions.pose.PoseLandmark.LEFT_SHOULDER,  mp.solutions.pose.PoseLandmark.LEFT_ELBOW),
-    (mp.solutions.pose.PoseLandmark.LEFT_ELBOW,     mp.solutions.pose.PoseLandmark.LEFT_WRIST),
-    (mp.solutions.pose.PoseLandmark.RIGHT_SHOULDER, mp.solutions.pose.PoseLandmark.RIGHT_ELBOW),
-    (mp.solutions.pose.PoseLandmark.RIGHT_ELBOW,    mp.solutions.pose.PoseLandmark.RIGHT_WRIST),
-]
-
-
-def _draw_debug(frame: np.ndarray, tracks, hand_result, pose_result) -> np.ndarray:
-    """デバッグ用：顔BBox・手・腕ランドマークを描画する。"""
-    out = frame.copy()
-    h, w = out.shape[:2]
-
-    # 顔BBox
-    for track in tracks:
-        x, y, bw, bh = track.bbox
-        cv2.rectangle(out, (x, y), (x + bw, y + bh), (0, 255, 0), 2)
-        cv2.putText(out, f"id={track.track_id}", (x, y - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1)
-
-    # Hands：各手のランドマーク全点 + 手首を強調
-    mp_drawing = mp.solutions.drawing_utils
-    if hand_result.multi_hand_landmarks:
-        for hand_lms in hand_result.multi_hand_landmarks:
-            mp_drawing.draw_landmarks(
-                out, hand_lms, mp.solutions.hands.HAND_CONNECTIONS,
-                mp_drawing.DrawingSpec(color=(255, 100, 0), thickness=2, circle_radius=3),
-                mp_drawing.DrawingSpec(color=(255, 200, 0), thickness=1),
-            )
-            # 手首(landmark 0)を大きく強調
-            lm0 = hand_lms.landmark[0]
-            cx, cy = int(lm0.x * w), int(lm0.y * h)
-            cv2.circle(out, (cx, cy), 10, (0, 0, 255), -1)
-            cv2.putText(out, "wrist(H)", (cx + 8, cy),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
-
-    # Pose：腕・手首ランドマークのみ描画
-    if pose_result.pose_landmarks:
-        lm = pose_result.pose_landmarks.landmark
-        # 接続線
-        for a, b in _POSE_ARM_CONNECTIONS:
-            pa = (int(lm[a].x * w), int(lm[a].y * h))
-            pb = (int(lm[b].x * w), int(lm[b].y * h))
-            cv2.line(out, pa, pb, (0, 200, 255), 2)
-        # 各ランドマーク点
-        for pl in _POSE_ARM_LANDMARKS:
-            px, py = int(lm[pl].x * w), int(lm[pl].y * h)
-            is_wrist = pl in (
-                mp.solutions.pose.PoseLandmark.LEFT_WRIST,
-                mp.solutions.pose.PoseLandmark.RIGHT_WRIST,
-            )
-            color = (0, 80, 255) if is_wrist else (0, 200, 255)
-            radius = 10 if is_wrist else 6
-            cv2.circle(out, (px, py), radius, color, -1)
-            cv2.putText(out, pl.name.replace("_", " ").lower(), (px + 6, py),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, color, 1)
-
-    return out
-
-load_dotenv()
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 # ── 設定 ─────────────────────────────────────────────────────────────────
 CAMERA_INDEX        = int(os.getenv("CAMERA_INDEX", 0))
 MIC_INDEX           = int(v) if (v := os.getenv("MIC_INDEX")) else None
-CLAP_THRESHOLD_RMS  = int(os.getenv("CLAP_THRESHOLD_RMS", 3000))
+CLAP_THRESHOLD_RMS  = int(os.getenv("CLAP_THRESHOLD_RMS", 2000))
 AR_DISPLAY_SEC      = int(os.getenv("AR_DISPLAY_DURATION_SEC", 10))
 ASSET_PATH          = os.getenv("ASSET_PATH", str(Path(__file__).parent.parent / "assets" / "penguin.png"))
 S3_BUCKET           = os.getenv("S3_BUCKET_NAME", "")
@@ -142,7 +72,7 @@ def main():
     penguin_expires: dict[int, float] = {}
 
     detector.start(device_index=MIC_INDEX)
-    print("='q' キーで終了します。拍手を検知するとペンギンが出現します。")
+    print("'q' キーで終了します。拍手を検知するとペンギンが出現します。")
 
     try:
         while True:
@@ -151,43 +81,47 @@ def main():
                 print("[WARN] フレーム取得失敗。カメラ接続を確認してください。")
                 break
 
-            raw_frame = frame.copy()  # Rekognition 送信用の原画像
-            tracks, hand_result, pose_result = tracker.process(frame)
+            raw_frame = frame.copy()  # S3 送信用の原画像
+            tracks, yolo_result = tracker.process(frame)
             now = time.monotonic()
 
             # ── 拍手検知 ──────────────────────────────────────────────────
             if detector.consume():
-                target = tracker.find_clapping_face(hand_result, pose_result, frame.shape, tracks)
-                if target:
-                    penguin_expires[target.track_id] = now + AR_DISPLAY_SEC
-                    print(f"[検知] ファーストペンギン! track_id={target.track_id} center={target.center}")
-                    # 原画像を S3 に非同期アップロード
+                targets = tracker.find_clapping_faces(yolo_result, frame.shape, tracks)
+                if targets:
+                    for target in targets:
+                        penguin_expires[target.track_id] = now + AR_DISPLAY_SEC
+                        print(f"[検知] ファーストペンギン! track_id={target.track_id} center={target.center}")
+                    # 原画像をS3にアップロード（拍手検知時の1枚のみ）
                     executor.submit(_upload_to_s3, raw_frame, S3_RAW_PREFIX, "raw")
+                    # AR合成済み画像もこのフレームの1枚のみアップロード
+                    upload_composed = True
                 else:
                     print("[検知] 拍手音を検知しましたが顔を特定できませんでした（誤検知として無視）")
+                    upload_composed = False
+            else:
+                upload_composed = False
 
             # 期限切れエントリを削除
             penguin_expires = {tid: exp for tid, exp in penguin_expires.items() if now < exp}
 
             # ── AR合成 ────────────────────────────────────────────────────
             composed = frame
-            for tid, exp in penguin_expires.items():
+            for tid in penguin_expires:
                 face = next((t for t in tracks if t.track_id == tid), None)
                 if face:
                     x, y, w, h = face.bbox
-                    # 顔BBoxより1.5倍大きく、上方向にオフセットして被せる
                     ow = int(w * 1.5)
                     oh = int(h * 1.5)
                     ox = x - (ow - w) // 2
                     oy = y - oh // 2
                     composed = overlay.apply(composed, ox, oy, ow, oh)
 
-            # 合成画像を S3 に非同期アップロード（ペンギン表示中のみ）
-            if penguin_expires:
+            # 合成画像を S3 にアップロード（拍手検知時の1枚のみ）
+            if upload_composed:
                 executor.submit(_upload_to_s3, composed, S3_COMPOSED_PREFIX, "composed")
 
-            debug = _draw_debug(composed, tracks, hand_result, pose_result)
-            cv2.imshow("First Penguin AR", debug)
+            cv2.imshow("First Penguin AR", draw_debug(composed, tracks, yolo_result))
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
