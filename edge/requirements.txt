@@ -1,6 +1,6 @@
 # 映像処理
 mediapipe==0.10.14
-opencv-python==4.10.0.86  # imshow を使うため headless でない版を使用
+opencv-python==4.10.0.84  # imshow を使うため headless でない版を使用
 
 # 音声処理
 pyaudio==0.2.14

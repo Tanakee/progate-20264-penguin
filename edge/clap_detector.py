@@ -7,7 +7,7 @@ import pyaudio
 CHUNK = 1024
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
-RATE = 44100
+RATE = 48000
 
 
 class ClapDetector:
@@ -17,11 +17,11 @@ class ClapDetector:
     メインループとは別スレッドで動作する。
     """
 
-    def __init__(self, threshold_rms: int = 3000, cooldown_sec: float = 1.5):
+    def __init__(self, threshold_rms: int = 2000, cooldown_sec: float = 1.5):
         """
         Args:
             threshold_rms: 拍手と判定する RMS 閾値（int16スケール: 0〜32767）
-                           静かな室内での拍手は概ね 2000〜6000 程度。
+                           静かな室内での拍手は概ね 1500〜3000 程度。
                            .env の CLAP_THRESHOLD_RMS で調整すること。
             cooldown_sec:  連続検知を防ぐクールダウン秒数
         """
@@ -37,11 +37,13 @@ class ClapDetector:
         """PyAudio 内部スレッドから呼ばれるコールバック。重い処理は禁止。"""
         samples = np.frombuffer(in_data, dtype=np.int16).astype(np.float32)
         rms = np.sqrt(np.mean(samples ** 2))
+        print(f"[Audio] RMS={rms:.0f} (threshold={self._threshold})", flush=True)
         now = time.monotonic()
         with self._lock:
             if rms > self._threshold and (now - self._last_clap_time) > self._cooldown_sec:
                 self._last_clap_time = now
                 self._event.set()
+                print(f"[Audio] 拍手検知! RMS={rms:.0f}", flush=True)
         return (None, pyaudio.paContinue)
 
     def start(self, device_index: int | None = None):
