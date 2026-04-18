@@ -1,7 +1,6 @@
 # 映像処理
-mediapipe==0.10.14
-opencv-python==4.10.0.84  # imshow を使うため headless でない版を使用
-ultralytics>=8.2.0        # YOLOv8-pose（複数人姿勢推定）
+opencv-python==4.10.0.84
+ultralytics>=8.2.0
 
 # 音声処理
 pyaudio==0.2.14
@@ -10,10 +9,6 @@ numpy==1.26.4
 # AWS連携
 boto3==1.34.144
 botocore==1.34.144
-
-# AppSync (GraphQL over WebSocket)
-gql[websockets]==3.5.0
-requests==2.32.3
 
 # 環境変数管理
 python-dotenv==1.0.1
