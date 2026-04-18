@@ -34,22 +34,39 @@ class TrackedFace:
         return (x + w // 2, y + h // 2)
 
 
+@dataclass
+class _GestureEntry:
+    """拍手ジェスチャーの1フレーム分の記録。"""
+    timestamp: float
+    clap_center: tuple[int, int]
+    person_bbox: tuple[float, float, float, float]  # YOLO の x1,y1,x2,y2
+
+
 class FaceTracker:
     """
     MediaPipe Face Detection で顔トラッキング、
-    YOLOv8-pose で複数人の姿勢推定（拍手検出）を行う。
+    YOLOv8s-pose で複数人の姿勢推定・拍手検出を行う。
+
+    精度向上のための施策:
+    - ジェスチャーバッファ: 直近1秒の検出履歴から音声と映像のタイミングズレを吸収
+    - 複数フレーム確認: CLAP_CONFIRM_MIN フレーム以上検出されたジェスチャーのみ採用
+    - 人物BBoxで顔マッチング: YOLO の人物領域を使って正確に顔を特定
+    - スペクトル解析: ClapDetector 側で高周波エネルギー比率を追加判定
     """
 
     TRACK_TIMEOUT_SEC       = 1.5
     IOU_THRESHOLD           = 0.3
-    CLAP_DIST_RATIO         = 0.15   # 両手首間距離がフレーム幅のこの割合以下なら拍手
-    CLAP_FACE_MAX_DIST_RATIO = 0.4   # 拍手中心から顔中心までの最大距離（フレーム幅の割合）
+    CLAP_DIST_RATIO         = 0.15    # 両手首間距離がフレーム幅のこの割合以下なら拍手
     MIN_FACE_SIZE_RATIO     = 0.04
     FACE_ASPECT_RATIO_RANGE = (0.5, 2.0)
-    KP_CONF_THRESHOLD       = 0.3    # キーポイントの信頼度下限
+    KP_CONF_THRESHOLD       = 0.3     # キーポイントの信頼度下限
+    CLAP_CENTER_DEDUP_RATIO = 0.1     # 同一フレーム内での二重検出除去距離
+    GESTURE_BUFFER_SEC      = 1.0     # ジェスチャー履歴の保持秒数
+    CLAP_CONFIRM_MIN        = 3       # 拍手確定に必要な最小検出フレーム数
+    CLAP_GROUP_DIST_RATIO   = 0.15    # 同一人物のジェスチャーとみなす距離（フレーム幅比）
 
     def __init__(self, model_selection: int = 1, min_confidence: float = 0.9,
-                 yolo_model: str = "yolov8n-pose.pt"):
+                 yolo_model: str = "yolov8s-pose.pt"):
         self._face_det = mp.solutions.face_detection.FaceDetection(
             model_selection=model_selection,
             min_detection_confidence=min_confidence,
@@ -57,10 +74,12 @@ class FaceTracker:
         self._yolo = YOLO(yolo_model)
         self._tracks: list[TrackedFace] = []
         self._next_id = 0
+        self._gesture_buffer: list[_GestureEntry] = []
 
     def process(self, frame_bgr: np.ndarray) -> tuple[list[TrackedFace], object]:
         """
-        フレームを受け取り、トラッキング済み顔リストと YOLO 推論結果を返す。
+        フレームを受け取り、顔トラッキングと YOLO 推論を実行する。
+        ジェスチャーバッファは毎フレーム自動更新される。
         """
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         frame_rgb.flags.writeable = False
@@ -69,46 +88,44 @@ class FaceTracker:
         yolo_result = self._yolo(frame_bgr, verbose=False)[0]
 
         h, w = frame_bgr.shape[:2]
+        now = time.monotonic()
+
         detected = self._extract_bboxes(face_result, w, h)
         self._update_tracks(detected)
         self._expire_tracks()
+
+        # 毎フレームジェスチャーを検出してバッファを更新
+        new_gestures = self._detect_clap_gestures(yolo_result, w, h, now)
+        self._update_gesture_buffer(new_gestures, now)
 
         return self._tracks, yolo_result
 
     def find_clapping_faces(
         self,
-        yolo_result,
         frame_shape: tuple,
         tracks: list[TrackedFace],
     ) -> list[TrackedFace]:
         """
-        拍手ジェスチャーをしている全員の顔を返す。
-        各人物の両手首座標を YOLO から取得し、近接していれば拍手と判定する。
+        バッファ内でCLAP_CONFIRM_MIN回以上検出された拍手ジェスチャーに対応する
+        顔トラックのリストを返す。人物BBoxを使って顔を特定する。
         """
         if not tracks:
             return []
 
         h, w = frame_shape[:2]
-        clap_centers = self._detect_clap_centers(yolo_result, w, h)
-
-        if not clap_centers:
+        confirmed = self._get_confirmed_clap_gestures(w)
+        if not confirmed:
             return []
 
-        max_dist = w * self.CLAP_FACE_MAX_DIST_RATIO
         result: list[TrackedFace] = []
-        used_track_ids: set[int] = set()
-
-        for center in clap_centers:
-            candidates = [t for t in tracks if t.track_id not in used_track_ids]
-            if not candidates:
-                break
-            closest = min(candidates, key=lambda t: _dist(t.center, center))
-            if _dist(closest.center, center) <= max_dist:
-                result.append(closest)
-                used_track_ids.add(closest.track_id)
+        used_ids: set[int] = set()
+        for gesture in confirmed:
+            face = self._find_face_in_person_bbox(gesture.person_bbox, tracks, used_ids)
+            if face:
+                result.append(face)
+                used_ids.add(face.track_id)
             else:
-                print(f"[YOLO] 最近傍の顔が遠すぎるため除外 "
-                      f"(dist={_dist(closest.center, center):.0f}px > {max_dist:.0f}px)", flush=True)
+                print(f"[Tracker] 人物BBox内に顔が見つかりませんでした", flush=True)
 
         return result
 
@@ -152,54 +169,118 @@ class FaceTracker:
         now = time.monotonic()
         self._tracks = [t for t in self._tracks if now - t.last_seen < self.TRACK_TIMEOUT_SEC]
 
-    CLAP_CENTER_DEDUP_RATIO = 0.1  # この距離以内の拍手中心は同一人物として重複除去
-
-    def _detect_clap_centers(self, yolo_result, w: int, h: int) -> list[tuple[int, int]]:
-        """YOLO の推論結果から拍手している人全員の手首中点を返す。"""
-        centers = []
+    def _detect_clap_gestures(
+        self, yolo_result, w: int, h: int, now: float
+    ) -> list[_GestureEntry]:
+        """YOLO結果から拍手ジェスチャーを検出し GestureEntry のリストを返す。"""
+        entries = []
         kps = yolo_result.keypoints
         if kps is None or kps.xy is None or len(kps.xy) == 0:
-            print("[YOLO] 人物未検出", flush=True)
-            return centers
+            return entries
 
-        conf = kps.conf  # shape: (num_persons, 17) or None
-        print(f"[YOLO] 検出人数={len(kps.xy)}", flush=True)
+        conf = kps.conf
+        boxes = yolo_result.boxes
+        seen_centers: list[tuple] = []
+        dedup_dist = w * self.CLAP_CENTER_DEDUP_RATIO
 
         for i, person_kps in enumerate(kps.xy):
             lw = person_kps[_KP_LEFT_WRIST].cpu().numpy()
             rw = person_kps[_KP_RIGHT_WRIST].cpu().numpy()
 
-            # キーポイントの信頼度チェック
             if conf is not None:
                 person_conf = conf[i].cpu().numpy()
-                lw_conf = person_conf[_KP_LEFT_WRIST]
-                rw_conf = person_conf[_KP_RIGHT_WRIST]
-                print(f"[YOLO] person={i} 手首信頼度 L={lw_conf:.2f} R={rw_conf:.2f} (閾値={self.KP_CONF_THRESHOLD})", flush=True)
-                if lw_conf < self.KP_CONF_THRESHOLD or rw_conf < self.KP_CONF_THRESHOLD:
-                    print(f"[YOLO] person={i} 手首信頼度不足でスキップ", flush=True)
+                if (person_conf[_KP_LEFT_WRIST] < self.KP_CONF_THRESHOLD or
+                        person_conf[_KP_RIGHT_WRIST] < self.KP_CONF_THRESHOLD):
                     continue
 
-            # 座標が (0, 0) の場合は未検出
-            if lw[0] == 0 and lw[1] == 0:
-                print(f"[YOLO] person={i} 左手首未検出", flush=True)
-                continue
-            if rw[0] == 0 and rw[1] == 0:
-                print(f"[YOLO] person={i} 右手首未検出", flush=True)
+            if (lw[0] == 0 and lw[1] == 0) or (rw[0] == 0 and rw[1] == 0):
                 continue
 
             dist = np.linalg.norm(lw - rw)
-            print(f"[YOLO] person={i} 両手首間距離={dist:.0f}px (閾値={w * self.CLAP_DIST_RATIO:.0f}px)", flush=True)
-            if dist < w * self.CLAP_DIST_RATIO:
-                center = (int((lw[0] + rw[0]) / 2), int((lw[1] + rw[1]) / 2))
-                # 既存の拍手中心と近すぎる場合は同一人物の二重検出として除外
-                dedup_dist = w * self.CLAP_CENTER_DEDUP_RATIO
-                if any(np.linalg.norm(np.array(center) - np.array(c)) < dedup_dist for c in centers):
-                    print(f"[YOLO] person={i} 二重検出のためスキップ", flush=True)
-                    continue
-                print(f"[YOLO] person={i} 拍手検出! 中心={center}", flush=True)
-                centers.append(center)
+            if dist >= w * self.CLAP_DIST_RATIO:
+                continue
 
-        return centers
+            center = (int((lw[0] + rw[0]) / 2), int((lw[1] + rw[1]) / 2))
+
+            # 同一フレーム内の二重検出を除去
+            if any(np.linalg.norm(np.array(center) - np.array(c)) < dedup_dist
+                   for c in seen_centers):
+                continue
+            seen_centers.append(center)
+
+            # 人物BBoxを取得（顔マッチングに使用）
+            if boxes is not None and i < len(boxes.xyxy):
+                person_bbox = tuple(boxes.xyxy[i].cpu().numpy().tolist())
+            else:
+                person_bbox = (center[0] - w * 0.1, 0, center[0] + w * 0.1, float(h))
+
+            entries.append(_GestureEntry(
+                timestamp=now,
+                clap_center=center,
+                person_bbox=person_bbox,
+            ))
+
+        return entries
+
+    def _update_gesture_buffer(self, new_entries: list[_GestureEntry], now: float):
+        """バッファに新エントリを追加し、期限切れエントリを削除する。"""
+        cutoff = now - self.GESTURE_BUFFER_SEC
+        self._gesture_buffer = [g for g in self._gesture_buffer if g.timestamp > cutoff]
+        self._gesture_buffer.extend(new_entries)
+
+    def _get_confirmed_clap_gestures(self, w: int) -> list[_GestureEntry]:
+        """
+        バッファ内のジェスチャーを近接でグループ化し、
+        CLAP_CONFIRM_MIN フレーム以上検出されたものを返す。
+        """
+        if not self._gesture_buffer:
+            return []
+
+        group_dist = w * self.CLAP_GROUP_DIST_RATIO
+        groups: list[list[_GestureEntry]] = []
+
+        for entry in self._gesture_buffer:
+            merged = False
+            for group in groups:
+                ref = np.array(group[-1].clap_center)
+                if np.linalg.norm(np.array(entry.clap_center) - ref) < group_dist:
+                    group.append(entry)
+                    merged = True
+                    break
+            if not merged:
+                groups.append([entry])
+
+        confirmed = []
+        for group in groups:
+            if len(group) >= self.CLAP_CONFIRM_MIN:
+                print(f"[Buffer] 拍手確定 ({len(group)}フレーム検出)", flush=True)
+                confirmed.append(group[-1])  # 最新エントリを使用
+
+        return confirmed
+
+    def _find_face_in_person_bbox(
+        self,
+        person_bbox: tuple,
+        tracks: list[TrackedFace],
+        exclude_ids: set[int],
+    ) -> TrackedFace | None:
+        """YOLO の人物BBox内にある顔トラックを返す。"""
+        x1, y1, x2, y2 = person_bbox
+        margin = 30  # ピクセル余白
+
+        candidates = [
+            t for t in tracks
+            if t.track_id not in exclude_ids
+            and x1 - margin <= t.center[0] <= x2 + margin
+            and y1 - margin <= t.center[1] <= y2 + margin
+        ]
+
+        if not candidates:
+            return None
+
+        # 人物BBoxの頭部付近（上部15%）に最も近い顔を返す
+        head_pos = ((x1 + x2) / 2, y1 + (y2 - y1) * 0.15)
+        return min(candidates, key=lambda t: _dist(t.center, head_pos))
 
     def close(self):
         self._face_det.close()
@@ -219,7 +300,7 @@ def _calc_iou(a: tuple, b: tuple) -> float:
     return inter / union if union > 0 else 0.0
 
 
-def _dist(a: tuple[int, int], b: tuple[int, int]) -> float:
+def _dist(a, b) -> float:
     return float(np.linalg.norm(np.array(a) - np.array(b)))
 
 
@@ -237,12 +318,18 @@ def draw_debug(frame: np.ndarray, tracks: list[TrackedFace], yolo_result) -> np.
         cv2.putText(out, f"id={track.track_id}", (x, y - 6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1)
 
+    # YOLO 人物BBox
+    if yolo_result.boxes is not None:
+        for box in yolo_result.boxes.xyxy:
+            x1, y1, x2, y2 = map(int, box.cpu().numpy())
+            cv2.rectangle(out, (x1, y1), (x2, y2), (200, 200, 0), 1)
+
     # YOLO 腕スケルトン
     kps = yolo_result.keypoints
     if kps is not None and kps.xy is not None:
         conf = kps.conf
         for i, person_kps in enumerate(kps.xy):
-            pts = person_kps.cpu().numpy().astype(int)  # (17, 2)
+            pts = person_kps.cpu().numpy().astype(int)
             person_conf = conf[i].cpu().numpy() if conf is not None else None
 
             def visible(idx):
@@ -250,19 +337,16 @@ def draw_debug(frame: np.ndarray, tracks: list[TrackedFace], yolo_result) -> np.
                     return False
                 return not (pts[idx][0] == 0 and pts[idx][1] == 0)
 
-            # 腕の接続線
             for a, b in _ARM_CONNECTIONS:
                 if visible(a) and visible(b):
                     cv2.line(out, tuple(pts[a]), tuple(pts[b]), (0, 200, 255), 2)
 
-            # 手首を強調
             for idx, label in [(_KP_LEFT_WRIST, "L"), (_KP_RIGHT_WRIST, "R")]:
                 if visible(idx):
                     cv2.circle(out, tuple(pts[idx]), 10, (0, 60, 255), -1)
                     cv2.putText(out, f"wrist {label}", (pts[idx][0] + 8, pts[idx][1]),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 60, 255), 1)
 
-            # 肩・肘
             for idx in [_KP_LEFT_SHOULDER, _KP_RIGHT_SHOULDER,
                         _KP_LEFT_ELBOW, _KP_RIGHT_ELBOW]:
                 if visible(idx):
