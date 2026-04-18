@@ -87,7 +87,7 @@ def main():
 
             # ── 拍手検知 ──────────────────────────────────────────────────
             if detector.consume():
-                targets = tracker.find_clapping_faces(yolo_result, frame.shape, tracks)
+                targets = tracker.find_clapping_faces(frame.shape, tracks)
                 if targets:
                     for target in targets:
                         penguin_expires[target.track_id] = now + AR_DISPLAY_SEC
