@@ -28,3 +28,8 @@ localstack-data/
 
 # YOLOモデルファイル（自動ダウンロードされるため除外）
 *.pt
+
+# Node.js / Next.js
+node_modules/
+.next/
+.env.local

@@ -1,6 +1,3 @@
-# AWS SDK（Lambda実行環境に標準搭載だが、バージョン固定のため明示）
 boto3==1.34.144
 botocore==1.34.144
-
-# 環境変数管理
 python-dotenv==1.0.1

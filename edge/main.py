@@ -19,11 +19,18 @@ from pathlib import Path
 
 import boto3
 import cv2
+import numpy as np
+from PIL import ImageFont, ImageDraw, Image
 from dotenv import load_dotenv
 
+from appsync_notifier import AppSyncNotifier
 from ar_overlay import AROverlay
 from clap_detector import ClapDetector
-from face_tracker import FaceTracker, TrackedFace, draw_debug
+from comment_receiver import CommentReceiver
+from face_tracker import (
+    FaceTracker, TrackedFace, draw_debug,
+    KP_LEFT_WRIST, KP_RIGHT_WRIST,
+)
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
@@ -36,7 +43,12 @@ log = logging.getLogger(__name__)
 
 # -- config --
 
-AR_OVERLAY_SCALE = 1.5
+AR_OVERLAY_SCALE_X = 4.0
+AR_OVERLAY_SCALE_Y = 1.0
+
+_JP_FONT_PATH = "/System/Library/Fonts/ヒラギノ角ゴシック W6.ttc"
+_JP_FONT_SIZE = 28
+_JP_FONT = ImageFont.truetype(_JP_FONT_PATH, _JP_FONT_SIZE)
 
 
 def _load_config() -> dict:
@@ -73,6 +85,8 @@ def _load_config() -> dict:
         "s3_raw_prefix": os.getenv("S3_RAW_PREFIX", "raw/"),
         "s3_composed_prefix": os.getenv("S3_COMPOSED_PREFIX", "composed/"),
         "aws_endpoint_url": os.getenv("AWS_ENDPOINT_URL"),
+        "appsync_endpoint": os.getenv("APPSYNC_ENDPOINT", ""),
+        "appsync_api_key": os.getenv("APPSYNC_API_KEY", ""),
     }
 
 
@@ -105,12 +119,133 @@ def _upload_to_s3(s3_client, bucket: str, img, prefix: str, label: str):
 CAMERA_RETRY_MAX = 30
 
 
+def _hex_to_bgr(hex_color: str) -> tuple[int, int, int]:
+    hex_color = hex_color.lstrip("#")
+    if len(hex_color) != 6:
+        return (255, 255, 255)
+    r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
+    return (b, g, r)
+
+
+def _get_text_size(text: str) -> tuple[int, int]:
+    bbox = _JP_FONT.getbbox(text)
+    return bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+
+def _put_jp_text(frame, text: str, x: int, y: int, color_rgb: tuple[int, int, int]):
+    pil_img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(pil_img)
+    # 縁取り
+    for dx in (-2, -1, 0, 1, 2):
+        for dy in (-2, -1, 0, 1, 2):
+            if dx == 0 and dy == 0:
+                continue
+            draw.text((x + dx, y + dy), text, font=_JP_FONT, fill=(0, 0, 0))
+    draw.text((x, y), text, font=_JP_FONT, fill=color_rgb)
+    frame[:] = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+
+def _draw_comment(frame, comment):
+    text = comment.text
+    color = _hex_to_bgr(comment.color)
+    x, y = int(comment.x), comment.y
+    alpha = 0.5
+
+    tw, th = _get_text_size(text)
+
+    pad_x, pad_y = 20, 14
+    body_w = tw + pad_x * 2
+    body_h = th + pad_y * 2
+    tail_w = int(body_h * 0.7)
+    fin_h = int(body_h * 0.3)
+
+    cx = x + tw // 2
+    cy = y - th // 2
+
+    total_w = body_w + tail_w + 10
+    total_h = body_h + fin_h + 10
+    rx1 = max(0, cx - body_w // 2 - 5)
+    ry1 = max(0, cy - body_h // 2 - 5)
+    rx2 = min(frame.shape[1], rx1 + total_w)
+    ry2 = min(frame.shape[0], ry1 + total_h)
+    if rx2 <= rx1 or ry2 <= ry1:
+        return
+
+    overlay = frame[ry1:ry2, rx1:rx2].copy()
+    fish = overlay.copy()
+
+    lcx = cx - rx1
+    lcy = cy - ry1
+
+    # 胴体（楕円）
+    body_rx = body_w // 2
+    body_ry = body_h // 2
+    cv2.ellipse(fish, (lcx, lcy), (body_rx, body_ry), 0, 0, 360, color, -1)
+
+    # 尾びれ（二股の三角形）
+    tail_base_x = lcx + body_rx - 5
+    tail_tip_x = tail_base_x + tail_w
+    tail_spread = int(body_ry * 0.9)
+    tail_pts_upper = np.array([
+        [tail_base_x, lcy - 2],
+        [tail_tip_x, lcy - tail_spread],
+        [tail_tip_x - tail_w // 3, lcy],
+    ], dtype=np.int32)
+    tail_pts_lower = np.array([
+        [tail_base_x, lcy + 2],
+        [tail_tip_x, lcy + tail_spread],
+        [tail_tip_x - tail_w // 3, lcy],
+    ], dtype=np.int32)
+    cv2.fillPoly(fish, [tail_pts_upper], color)
+    cv2.fillPoly(fish, [tail_pts_lower], color)
+
+    # 背びれ（上の三角）
+    dorsal_pts = np.array([
+        [lcx - body_rx // 3, lcy - body_ry + 2],
+        [lcx, lcy - body_ry - fin_h],
+        [lcx + body_rx // 3, lcy - body_ry + 2],
+    ], dtype=np.int32)
+    cv2.fillPoly(fish, [dorsal_pts], color)
+
+    # 腹びれ（下の小さい三角）
+    pelvic_pts = np.array([
+        [lcx + body_rx // 4, lcy + body_ry - 2],
+        [lcx + body_rx // 2, lcy + body_ry + fin_h // 2],
+        [lcx - body_rx // 6, lcy + body_ry - 2],
+    ], dtype=np.int32)
+    cv2.fillPoly(fish, [pelvic_pts], color)
+
+    # 目（白丸 + 黒瞳）
+    eye_x = lcx - body_rx // 2
+    eye_y = lcy - body_ry // 4
+    eye_r = max(4, body_ry // 5)
+    cv2.circle(fish, (eye_x, eye_y), eye_r, (255, 255, 255), -1)
+    cv2.circle(fish, (eye_x - 1, eye_y), max(2, eye_r // 2), (0, 0, 0), -1)
+
+    # 口（小さい弧）
+    mouth_x = lcx - body_rx + 8
+    mouth_y = lcy + 2
+    cv2.ellipse(fish, (mouth_x, mouth_y), (5, 3), 0, 30, 150, (0, 0, 0), 1, cv2.LINE_AA)
+
+    cv2.addWeighted(fish, alpha, overlay, 1 - alpha, 0, overlay)
+    frame[ry1:ry2, rx1:rx2] = overlay
+
+    # テキスト（魚の胴体中央）- Pillow で日本語描画
+    text_x = cx - tw // 2
+    text_y = cy - th // 2
+    _put_jp_text(frame, text, text_x, text_y, (255, 255, 255))
+
+
+STATIC_POSE_TIMEOUT = 1.5
+
+
 @dataclass
 class _PenguinState:
     """AR 表示中の状態。顔トラックが消えても最終位置を保持する。"""
     expire_time: float
     last_bbox: tuple[int, int, int, int]
     last_body_bbox: tuple[int, int, int, int] | None = None
+    close_wrist_since: float | None = None
 
 
 def main():
@@ -119,6 +254,12 @@ def main():
     cap = cv2.VideoCapture(cfg["camera_index"])
     if not cap.isOpened():
         sys.exit(f"[ERROR] カメラ {cfg['camera_index']} を開けません")
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    log.info("カメラ解像度: %dx%d", actual_w, actual_h)
 
     try:
         overlay = AROverlay(cfg["asset_path"])
@@ -130,12 +271,16 @@ def main():
     executor = ThreadPoolExecutor(max_workers=2)
 
     s3_client = _create_s3_client(cfg["aws_endpoint_url"]) if cfg["s3_bucket"] else None
+    notifier = AppSyncNotifier(cfg["appsync_endpoint"], cfg["appsync_api_key"])
+    comment_receiver = CommentReceiver(cfg["appsync_endpoint"], cfg["appsync_api_key"], frame_width=actual_w)
+    comment_receiver.start()
 
     penguin_states: dict[int, _PenguinState] = {}
     camera_fail_count = 0
 
     mic_ok = detector.start(device_index=cfg["mic_index"])
     if mic_ok:
+        detector.calibrate(duration_sec=3.0)
         log.info("'q' キーで終了。拍手を検知するとペンギンが出現します。")
     else:
         log.info("'q' キーで終了。マイクなしで起動しました。")
@@ -156,50 +301,123 @@ def main():
             tracks, yolo_result = tracker.process(frame)
             now = time.monotonic()
 
-            # -- clap detection --
+            # -- clap detection (audio + visual) --
             upload_composed = False
-            if detector.consume():
-                log.debug(
-                    "音声検知時バッファ内ジェスチャー数: %d", tracker.gesture_buffer_size
-                )
+            targets: list[TrackedFace] = []
+            audio_triggered = detector.consume()
+
+            # 音声トリガー時: ジェスチャー確認付きで検出
+            if audio_triggered:
                 targets = tracker.find_clapping_faces(frame.shape, tracks)
                 if targets:
                     detector.acknowledge()
-                    for target in targets:
-                        penguin_states[target.track_id] = _PenguinState(
-                            expire_time=now + cfg["ar_display_sec"],
-                            last_bbox=target.bbox,
-                            last_body_bbox=target.body_bbox,
-                        )
-                        log.info(
-                            "ファーストペンギン! track_id=%d center=%s",
-                            target.track_id,
-                            target.center,
-                        )
-                    if s3_client:
-                        executor.submit(
-                            _upload_to_s3,
-                            s3_client,
-                            cfg["s3_bucket"],
-                            raw_frame,
-                            cfg["s3_raw_prefix"],
-                            "raw",
-                        )
-                    upload_composed = True
+                    log.info("拍手検出 (音声+映像)")
                 else:
-                    log.info("拍手音を検知しましたが顔を特定できませんでした")
+                    log.info("拍手音を検知しましたが映像で確認できませんでした")
+
+            # 映像のみ検出: 音声で見つからなかった人も含めて追加
+            already = {t.track_id for t in targets}
+            visual_targets = tracker.find_visual_clappers(
+                frame.shape, tracks, exclude_ids=already
+            )
+            if visual_targets:
+                for vt in visual_targets:
+                    if vt.track_id not in already:
+                        targets.append(vt)
+                        log.info("拍手検出 (映像のみ) track_id=%d", vt.track_id)
+
+            if targets:
+                for target in targets:
+                    penguin_states[target.track_id] = _PenguinState(
+                        expire_time=now + cfg["ar_display_sec"],
+                        last_bbox=target.bbox,
+                        last_body_bbox=target.body_bbox,
+                    )
+                    log.info(
+                        "ファーストペンギン! track_id=%d center=%s",
+                        target.track_id,
+                        target.center,
+                    )
+                if s3_client:
+                    executor.submit(
+                        _upload_to_s3,
+                        s3_client,
+                        cfg["s3_bucket"],
+                        raw_frame,
+                        cfg["s3_raw_prefix"],
+                        "raw",
+                    )
+                for target in targets:
+                    executor.submit(
+                        notifier.notify,
+                        target.track_id,
+                        f"s3://{cfg['s3_bucket']}/{cfg['s3_raw_prefix']}",
+                    )
+                upload_composed = True
 
             # -- expire penguin states --
             penguin_states = {
                 tid: st for tid, st in penguin_states.items() if now < st.expire_time
             }
 
-            # -- update last_bbox for still-visible faces --
+            # -- update last_bbox + extend if still clapping --
+            current_clappers = {t.track_id for t in targets}
             for tid, state in penguin_states.items():
                 face = next((t for t in tracks if t.track_id == tid), None)
                 if face:
                     state.last_bbox = face.bbox
                     state.last_body_bbox = face.body_bbox
+                if tid in current_clappers:
+                    state.expire_time = now + cfg["ar_display_sec"]
+
+            # -- post-display cancellation (arm-crossing filter) --
+            kps = yolo_result.keypoints
+            if kps is not None and kps.xy is not None and len(kps.xy) > 0:
+                cancel_ids = []
+                for tid, state in penguin_states.items():
+                    ref_bbox = state.last_body_bbox or state.last_bbox
+                    rx, ry, rw, rh = ref_bbox
+                    best_idx, best_overlap = None, 0.0
+                    if yolo_result.boxes is not None:
+                        for pi, box in enumerate(yolo_result.boxes.xyxy):
+                            bx1, by1, bx2, by2 = box.cpu().numpy()
+                            ix1 = max(rx, bx1)
+                            iy1 = max(ry, by1)
+                            ix2 = min(rx + rw, bx2)
+                            iy2 = min(ry + rh, by2)
+                            inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+                            if inter > best_overlap:
+                                best_overlap = inter
+                                best_idx = pi
+
+                    if best_idx is not None:
+                        person_kps = kps.xy[best_idx]
+                        kp_conf = kps.conf[best_idx].cpu().numpy() if kps.conf is not None else None
+                        lw = person_kps[KP_LEFT_WRIST].cpu().numpy()
+                        rw_kp = person_kps[KP_RIGHT_WRIST].cpu().numpy()
+                        lw_ok = (lw[0] != 0 or lw[1] != 0) and (kp_conf is None or kp_conf[KP_LEFT_WRIST] >= 0.3)
+                        rw_ok = (rw_kp[0] != 0 or rw_kp[1] != 0) and (kp_conf is None or kp_conf[KP_RIGHT_WRIST] >= 0.3)
+
+                        if lw_ok and rw_ok:
+                            dist = float(np.linalg.norm(lw - rw_kp))
+                            pbox = yolo_result.boxes.xyxy[best_idx].cpu().numpy()
+                            person_w = float(pbox[2] - pbox[0])
+                            threshold = person_w * 0.45
+                            if dist < threshold:
+                                if state.close_wrist_since is None:
+                                    state.close_wrist_since = now
+                                elif now - state.close_wrist_since > STATIC_POSE_TIMEOUT:
+                                    cancel_ids.append(tid)
+                                    log.info("腕組み判定で取り消し track_id=%d (%.1f秒間静止)", tid, now - state.close_wrist_since)
+                            else:
+                                state.close_wrist_since = None
+                        else:
+                            state.close_wrist_since = None
+                    else:
+                        state.close_wrist_since = None
+
+                for tid in cancel_ids:
+                    del penguin_states[tid]
 
             # -- AR overlay (uses body_bbox for full-body penguin) --
             composed = frame
@@ -208,8 +426,8 @@ def main():
                     x, y, w, h = state.last_body_bbox
                 else:
                     x, y, w, h = state.last_bbox
-                ow = int(w * AR_OVERLAY_SCALE)
-                oh = int(h * AR_OVERLAY_SCALE)
+                ow = int(w * AR_OVERLAY_SCALE_X)
+                oh = int(h * AR_OVERLAY_SCALE_Y)
                 ox = x - (ow - w) // 2
                 oy = y - (oh - h) // 2
                 composed = overlay.apply(composed, ox, oy, ow, oh)
@@ -224,11 +442,23 @@ def main():
                     "composed",
                 )
 
+            # -- ニコニコ風コメント描画 --
+            comments = comment_receiver.get_comments()
+            alive = []
+            for c in comments:
+                c.x -= c.speed
+                if c.x > -500:
+                    _draw_comment(composed, c)
+                    alive.append(c)
+            comment_receiver.update_comments(alive)
+
             cv2.imshow("First Penguin AR", draw_debug(composed, tracks, yolo_result))
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
     finally:
+        notifier.send_summary()
+        comment_receiver.stop()
         detector.stop()
         tracker.close()
         cap.release()
