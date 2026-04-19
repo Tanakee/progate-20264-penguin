@@ -27,18 +27,20 @@ from appsync_notifier import AppSyncNotifier
 from ar_overlay import AROverlay
 from clap_detector import ClapDetector
 from comment_receiver import CommentReceiver
-from face_tracker import (
-    FaceTracker, TrackedFace, draw_debug,
-    KP_LEFT_WRIST, KP_RIGHT_WRIST,
-)
+from face_tracker import FaceTracker, TrackedFace, draw_debug
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     datefmt="%H:%M:%S",
 )
+logging.getLogger("ultralytics").setLevel(logging.WARNING)
+logging.getLogger("botocore").setLevel(logging.WARNING)
+logging.getLogger("boto3").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("websocket").setLevel(logging.INFO)
 log = logging.getLogger(__name__)
 
 # -- config --
@@ -236,16 +238,12 @@ def _draw_comment(frame, comment):
     _put_jp_text(frame, text, text_x, text_y, (255, 255, 255))
 
 
-STATIC_POSE_TIMEOUT = 1.5
-
-
 @dataclass
 class _PenguinState:
     """AR 表示中の状態。顔トラックが消えても最終位置を保持する。"""
     expire_time: float
     last_bbox: tuple[int, int, int, int]
     last_body_bbox: tuple[int, int, int, int] | None = None
-    close_wrist_since: float | None = None
 
 
 def main():
@@ -370,54 +368,11 @@ def main():
                 if tid in current_clappers:
                     state.expire_time = now + cfg["ar_display_sec"]
 
-            # -- post-display cancellation (arm-crossing filter) --
-            kps = yolo_result.keypoints
-            if kps is not None and kps.xy is not None and len(kps.xy) > 0:
-                cancel_ids = []
-                for tid, state in penguin_states.items():
-                    ref_bbox = state.last_body_bbox or state.last_bbox
-                    rx, ry, rw, rh = ref_bbox
-                    best_idx, best_overlap = None, 0.0
-                    if yolo_result.boxes is not None:
-                        for pi, box in enumerate(yolo_result.boxes.xyxy):
-                            bx1, by1, bx2, by2 = box.cpu().numpy()
-                            ix1 = max(rx, bx1)
-                            iy1 = max(ry, by1)
-                            ix2 = min(rx + rw, bx2)
-                            iy2 = min(ry + rh, by2)
-                            inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-                            if inter > best_overlap:
-                                best_overlap = inter
-                                best_idx = pi
-
-                    if best_idx is not None:
-                        person_kps = kps.xy[best_idx]
-                        kp_conf = kps.conf[best_idx].cpu().numpy() if kps.conf is not None else None
-                        lw = person_kps[KP_LEFT_WRIST].cpu().numpy()
-                        rw_kp = person_kps[KP_RIGHT_WRIST].cpu().numpy()
-                        lw_ok = (lw[0] != 0 or lw[1] != 0) and (kp_conf is None or kp_conf[KP_LEFT_WRIST] >= 0.3)
-                        rw_ok = (rw_kp[0] != 0 or rw_kp[1] != 0) and (kp_conf is None or kp_conf[KP_RIGHT_WRIST] >= 0.3)
-
-                        if lw_ok and rw_ok:
-                            dist = float(np.linalg.norm(lw - rw_kp))
-                            pbox = yolo_result.boxes.xyxy[best_idx].cpu().numpy()
-                            person_w = float(pbox[2] - pbox[0])
-                            threshold = person_w * 0.45
-                            if dist < threshold:
-                                if state.close_wrist_since is None:
-                                    state.close_wrist_since = now
-                                elif now - state.close_wrist_since > STATIC_POSE_TIMEOUT:
-                                    cancel_ids.append(tid)
-                                    log.info("腕組み判定で取り消し track_id=%d (%.1f秒間静止)", tid, now - state.close_wrist_since)
-                            else:
-                                state.close_wrist_since = None
-                        else:
-                            state.close_wrist_since = None
-                    else:
-                        state.close_wrist_since = None
-
-                for tid in cancel_ids:
-                    del penguin_states[tid]
+            # -- post-display cancellation (arm-crossing via state machine) --
+            cancel_ids = [tid for tid in penguin_states if tracker.is_arm_crossing(tid)]
+            for tid in cancel_ids:
+                log.info("腕組み判定で取り消し track_id=%d", tid)
+                del penguin_states[tid]
 
             # -- AR overlay (uses body_bbox for full-body penguin) --
             composed = frame
@@ -452,7 +407,7 @@ def main():
                     alive.append(c)
             comment_receiver.update_comments(alive)
 
-            cv2.imshow("First Penguin AR", draw_debug(composed, tracks, yolo_result))
+            cv2.imshow("First Penguin AR", draw_debug(composed, tracks, yolo_result, tracker._person_clap_trackers))
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 

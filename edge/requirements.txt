@@ -6,6 +6,9 @@ ultralytics>=8.2.0
 pyaudio==0.2.14
 numpy==1.26.4
 
+# 信号処理 (拍手周期性検出)
+scipy>=1.11.0
+
 # AWS連携
 boto3==1.34.144
 botocore==1.34.144
