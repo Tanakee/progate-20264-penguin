@@ -20,6 +20,7 @@ from pathlib import Path
 import boto3
 import cv2
 import numpy as np
+import pyvirtualcam
 from PIL import ImageFont, ImageDraw, Image
 from dotenv import load_dotenv
 
@@ -273,6 +274,9 @@ def main():
     comment_receiver = CommentReceiver(cfg["appsync_endpoint"], cfg["appsync_api_key"], frame_width=actual_w)
     comment_receiver.start()
 
+    vcam = pyvirtualcam.Camera(width=actual_w, height=actual_h, fps=30)
+    log.info("仮想カメラ起動: %s (%dx%d)", vcam.device, actual_w, actual_h)
+
     penguin_states: dict[int, _PenguinState] = {}
     camera_fail_count = 0
 
@@ -407,11 +411,14 @@ def main():
                     alive.append(c)
             comment_receiver.update_comments(alive)
 
-            cv2.imshow("First Penguin AR", draw_debug(composed, tracks, yolo_result, tracker._person_clap_trackers))
+            debug_frame = draw_debug(composed, tracks, yolo_result, tracker._person_clap_trackers)
+            vcam.send(cv2.cvtColor(debug_frame, cv2.COLOR_BGR2RGB))
+            cv2.imshow("First Penguin AR", debug_frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
     finally:
+        vcam.close()
         notifier.send_summary()
         comment_receiver.stop()
         detector.stop()
