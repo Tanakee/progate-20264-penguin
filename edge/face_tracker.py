@@ -43,26 +43,18 @@ class TrackedFace:
 
 
 class ClapState(Enum):
-    IDLE = auto()
-    APPROACHING = auto()
-    CONTACT = auto()
-    SEPARATING = auto()
+    FAR = auto()
+    CLOSE = auto()
 
 
 @dataclass
 class PersonClapTracker:
     track_id: int
-    state: ClapState = ClapState.IDLE
-    smoothed_dist: float | None = None
-    prev_smoothed_dist: float | None = None
-    prev_velocity: float | None = None
-    contact_frame_count: int = 0
-    frames_since_transition: int = 0
-    last_valid_kps: dict | None = None
-    occluded_frames: int = 0
-    distance_history: list = field(default_factory=list)
-    debounce_remaining: int = 0
-    sustained_mode: bool = False
+    state: ClapState = ClapState.FAR
+    prev_dist: float | None = None
+    prev_threshold: float | None = None
+    last_fire_time: float = 0.0
+    current_dist: float | None = None
 
 
 @dataclass
@@ -77,43 +69,19 @@ class ClapEvent:
 class FaceTracker:
     """
     YOLOv8-pose で顔検出・姿勢推定・拍手ジェスチャー検出を一本化。
-    MediaPipe を廃止し、YOLO の nose keypoint + person bbox から顔領域を推定する。
+    v3: 手首距離の閾値クロスのみで発火するシンプルなアルゴリズム。
     """
 
     # -- tracking --
     TRACK_TIMEOUT_SEC = 1.5
     IOU_THRESHOLD = 0.3
-    HEAD_REGION_RATIO = 0.15
     FACE_BBOX_MARGIN_RATIO = 0.03
     NOSE_CONF_THRESHOLD = 0.3
-    KP_CONF_THRESHOLD = 0.15
+    WRIST_CONF_MIN = 0.3
 
-    # -- Layer 1: normalized distance + EMA --
-    EMA_ALPHA = 0.35
-
-    # -- Layer 2: state machine --
-    FAR_THRESHOLD = 1.0
-    CONTACT_THRESHOLD = 0.6
-    APPROACH_VELOCITY_MIN = -0.01
-    MIN_CONTACT_FRAMES = 1
-    MAX_CONTACT_FRAMES = 8
-    STATE_TIMEOUT_FRAMES = 25
-    WRIST_Y_DIFF_RATIO = 0.3
-    WRIST_X_MARGIN_RATIO = 0.5
-    OCCLUSION_GRACE_FRAMES = 20
-
-    # -- debounce --
-    DEBOUNCE_SINGLE_FRAMES = 12
-    DEBOUNCE_SUSTAINED_FRAMES = 9
-
-    # -- Layer 3: periodicity --
-    DISTANCE_HISTORY_SIZE = 90
-    PERIODICITY_MIN_PEAKS = 3
-    PERIODICITY_CV_MAX = 0.4
-    PERIODICITY_FREQ_MIN = 2.0
-    PERIODICITY_FREQ_MAX = 7.5
-    PERIODICITY_PROMINENCE = 0.15
-    PERIODICITY_MIN_PEAK_DISTANCE = 5
+    # -- clap detection v3 --
+    CLOSE_RATIO = 0.35
+    DEBOUNCE_SEC = 1.0
 
     def __init__(self, yolo_model: str = "yolov8s-pose.pt"):
         self._yolo = YOLO(yolo_model)
@@ -134,11 +102,6 @@ class FaceTracker:
         self._current_clap_events = self._run_clap_detection(yolo_result, now)
         self._expire_person_clap_trackers()
 
-        if self._tracks or self._person_clap_trackers:
-            track_ids = [t.track_id for t in self._tracks]
-            pct_summary = {tid: pct.state.name for tid, pct in self._person_clap_trackers.items()}
-            log.debug("[frame] tracks=%s clap_states=%s events=%d", track_ids, pct_summary, len(self._current_clap_events))
-
         return self._tracks, yolo_result
 
     def find_clapping_faces(
@@ -146,10 +109,6 @@ class FaceTracker:
         frame_shape: tuple,
         tracks: list[TrackedFace],
     ) -> list[TrackedFace]:
-        """
-        確定した拍手ジェスチャーに対応する顔を返す。
-        フレーム中央に近い順にソートして返す（要件: 中央優先）。
-        """
         if not tracks or not self._current_clap_events:
             return []
 
@@ -165,8 +124,6 @@ class FaceTracker:
             if face:
                 result.append(face)
                 used_ids.add(face.track_id)
-            else:
-                log.debug("ClapEvent track_id=%d に対応する顔が見つかりません", event.track_id)
 
         result.sort(key=lambda t: _dist(t.center, frame_center))
         return result
@@ -177,7 +134,6 @@ class FaceTracker:
         tracks: list[TrackedFace],
         exclude_ids: set[int] | None = None,
     ) -> list[TrackedFace]:
-        """音声トリガーなしで、映像のジェスチャーバッファだけで拍手者を返す。"""
         if not tracks or not self._current_clap_events:
             return []
 
@@ -201,34 +157,20 @@ class FaceTracker:
         self,
         tracks: list[TrackedFace],
     ) -> TrackedFace | None:
-        """音声トリガー時に映像で確定できなかった場合、最有力候補を返す。"""
         if not tracks:
             return None
-
-        active_states = (ClapState.APPROACHING, ClapState.CONTACT, ClapState.SEPARATING)
         best: TrackedFace | None = None
-        best_score = -1
-
+        best_dist = float("inf")
         for t in tracks:
             pct = self._person_clap_trackers.get(t.track_id)
-            score = 0
-            if pct is not None:
-                if pct.state in active_states:
-                    score = 30
-                elif pct.occluded_frames > 0:
-                    score = 20
-                elif pct.state == ClapState.IDLE and pct.smoothed_dist is not None:
-                    score = 10
-            if score > best_score:
-                best_score = score
-                best = t
-
-        if best is not None and best_score > 0:
+            if pct is not None and pct.current_dist is not None:
+                if pct.current_dist < best_dist:
+                    best_dist = pct.current_dist
+                    best = t
+        if best is not None:
             return best
-
         if len(tracks) == 1:
             return tracks[0]
-
         return None
 
     @property
@@ -236,22 +178,13 @@ class FaceTracker:
         return len(self._person_clap_trackers)
 
     def is_arm_crossing(self, track_id: int) -> bool:
-        pct = self._person_clap_trackers.get(track_id)
-        if pct is None:
-            return False
-        return (
-            pct.state == ClapState.CONTACT
-            and pct.contact_frame_count > self.MAX_CONTACT_FRAMES
-        )
+        return False
 
     # -- private --
 
     def _extract_face_bboxes(
         self, yolo_result: Results, w: int, h: int
     ) -> list[tuple[tuple[int, int, int, int], tuple[int, int, int, int] | None]]:
-        """YOLO の nose keypoint + person bbox から顔領域を推定する。
-        Returns list of (face_bbox, body_bbox) tuples.
-        """
         boxes: list[tuple[tuple[int, int, int, int], tuple[int, int, int, int] | None]] = []
         kps = yolo_result.keypoints
         if kps is None or kps.xy is None or len(kps.xy) == 0:
@@ -307,24 +240,16 @@ class FaceTracker:
                 best_track.bbox = face_bbox
                 best_track.body_bbox = body_bbox
                 best_track.last_seen = time.monotonic()
-                log.debug("[track] updated track_id=%d iou=%.2f bbox=%s", best_track.track_id, best_iou, face_bbox)
             else:
                 new_id = self._next_id
                 self._tracks.append(TrackedFace(track_id=new_id, bbox=face_bbox, body_bbox=body_bbox))
                 self._next_id += 1
-                log.info("[track] NEW track_id=%d bbox=%s body=%s", new_id, face_bbox, body_bbox)
 
     def _expire_tracks(self):
         now = time.monotonic()
-        before = len(self._tracks)
-        expired = [t for t in self._tracks if now - t.last_seen >= self.TRACK_TIMEOUT_SEC]
-        for t in expired:
-            log.info("[track] EXPIRED track_id=%d (unseen %.1fs)", t.track_id, now - t.last_seen)
         self._tracks = [
             t for t in self._tracks if now - t.last_seen < self.TRACK_TIMEOUT_SEC
         ]
-
-    # -- 3-layer clap detection --
 
     def _run_clap_detection(
         self, yolo_result: Results, now: float,
@@ -336,12 +261,6 @@ class FaceTracker:
 
         conf = kps.conf
         boxes = yolo_result.boxes
-        required_kps = [
-            KP_LEFT_SHOULDER, KP_RIGHT_SHOULDER,
-            KP_LEFT_WRIST, KP_RIGHT_WRIST,
-            KP_LEFT_HIP, KP_RIGHT_HIP,
-        ]
-
         processed_track_ids: set[int] = set()
 
         for i, person_kps_t in enumerate(kps.xy):
@@ -355,65 +274,58 @@ class FaceTracker:
 
             track_id = self._map_person_to_track(person_bbox)
             if track_id is None:
-                log.debug("[clap-diag] person %d: no track_id mapped", i)
                 continue
 
             if track_id in processed_track_ids:
-                log.debug("[clap-diag] person %d: track_id=%d already processed, skip", i, track_id)
                 continue
             processed_track_ids.add(track_id)
+
+            lw_conf = float(person_conf[KP_LEFT_WRIST]) if person_conf is not None else 1.0
+            rw_conf = float(person_conf[KP_RIGHT_WRIST]) if person_conf is not None else 1.0
+            if lw_conf < self.WRIST_CONF_MIN or rw_conf < self.WRIST_CONF_MIN:
+                continue
+
+            lw = person_kps[KP_LEFT_WRIST]
+            rw = person_kps[KP_RIGHT_WRIST]
+            if (lw[0] == 0 and lw[1] == 0) or (rw[0] == 0 and rw[1] == 0):
+                continue
+
+            dist = float(np.linalg.norm(lw - rw))
+
+            x1, y1, x2, y2 = person_bbox
+            bbox_width = x2 - x1
+            if bbox_width < 1:
+                continue
+            threshold = bbox_width * self.CLOSE_RATIO
 
             pct = self._person_clap_trackers.get(track_id)
             if pct is None:
                 pct = PersonClapTracker(track_id=track_id)
                 self._person_clap_trackers[track_id] = pct
 
-            resolved = self._resolve_keypoints(pct, person_kps, person_conf, required_kps)
-            if resolved is None:
-                log.debug("[clap-diag] track=%d: keypoints rejected (occluded=%d)", track_id, pct.occluded_frames)
-                if pct.state == ClapState.IDLE:
-                    self._reset_state(pct)
-                continue
+            pct.current_dist = dist
 
-            ls = resolved[KP_LEFT_SHOULDER]
-            rs = resolved[KP_RIGHT_SHOULDER]
-            shoulder_width = float(np.linalg.norm(np.array(ls) - np.array(rs)))
-            if shoulder_width < 1e-6:
-                continue
-
-            lh = resolved[KP_LEFT_HIP]
-            rh = resolved[KP_RIGHT_HIP]
-            mid_shoulder_y = (ls[1] + rs[1]) / 2
-            mid_hip_y = (lh[1] + rh[1]) / 2
-            torso_height = abs(mid_hip_y - mid_shoulder_y)
-
-            lw_pos = resolved[KP_LEFT_WRIST]
-            rw_pos = resolved[KP_RIGHT_WRIST]
-            wrist_dist = float(np.linalg.norm(np.array(lw_pos) - np.array(rw_pos)))
-            norm_dist = wrist_dist / shoulder_width
-
-            if norm_dist > 5.0:
-                log.debug("[clap-diag] track=%d: norm_dist=%.2f too large, skip", track_id, norm_dist)
-                continue
-
-            spatial_ok = self._is_valid_clap_position(
-                resolved, shoulder_width, torso_height,
-            )
-            is_occluded = pct.occluded_frames > 0
-
-            log.debug(
-                "[clap-diag] track=%d state=%s d=%.2f sd=%.2f v=%s spatial=%s occ=%d",
-                track_id, pct.state.name, norm_dist,
-                pct.smoothed_dist if pct.smoothed_dist is not None else -1,
-                f"{pct.prev_velocity:.4f}" if pct.prev_velocity is not None else "None",
-                spatial_ok, pct.occluded_frames,
+            crossed = (
+                pct.prev_dist is not None
+                and pct.prev_threshold is not None
+                and pct.prev_dist >= pct.prev_threshold
+                and dist < threshold
             )
 
-            event = self._update_person_clap_state(
-                pct, norm_dist, spatial_ok, is_occluded, person_bbox, now,
-            )
-            if event is not None:
-                events.append(event)
+            pct.state = ClapState.CLOSE if dist < threshold else ClapState.FAR
+            pct.prev_dist = dist
+            pct.prev_threshold = threshold
+
+            if crossed and (now - pct.last_fire_time) > self.DEBOUNCE_SEC:
+                pct.last_fire_time = now
+                center = (int((lw[0] + rw[0]) / 2), int((lw[1] + rw[1]) / 2))
+                events.append(ClapEvent(
+                    track_id=track_id,
+                    clap_center=center,
+                    person_bbox=person_bbox,
+                    timestamp=now,
+                ))
+                log.info("拍手検出 track_id=%d dist=%.0f thresh=%.0f", track_id, dist, threshold)
 
         return events
 
@@ -438,245 +350,16 @@ class FaceTracker:
             if iou > best_iou:
                 best_iou = iou
                 best_tid = t.track_id
-        if best_tid is not None:
-            log.debug("[map] person_bbox=(%.0f,%.0f,%.0f,%.0f) -> track_id=%d iou=%.3f",
-                      x1, y1, x2, y2, best_tid, best_iou)
         return best_tid if best_iou > 0.1 else None
-
-    def _resolve_keypoints(
-        self,
-        pct: PersonClapTracker,
-        person_kps: np.ndarray,
-        person_conf: np.ndarray | None,
-        required: list[int],
-    ) -> dict[int, tuple[float, float]] | None:
-        if pct.last_valid_kps is None:
-            pct.last_valid_kps = {}
-
-        resolved: dict[int, tuple[float, float]] = {}
-        any_occluded = False
-
-        for idx in required:
-            pt = person_kps[idx]
-            c = float(person_conf[idx]) if person_conf is not None else 1.0
-            is_zero = pt[0] == 0 and pt[1] == 0
-
-            if c >= self.KP_CONF_THRESHOLD and not is_zero:
-                resolved[idx] = (float(pt[0]), float(pt[1]))
-                pct.last_valid_kps[idx] = resolved[idx]
-            elif idx in pct.last_valid_kps:
-                any_occluded = True
-                resolved[idx] = pct.last_valid_kps[idx]
-            else:
-                return None
-
-        if any_occluded:
-            pct.occluded_frames += 1
-            if pct.occluded_frames > self.OCCLUSION_GRACE_FRAMES:
-                return None
-        else:
-            pct.occluded_frames = 0
-
-        return resolved
-
-    @classmethod
-    def _is_valid_clap_position(
-        cls,
-        kps: dict[int, tuple[float, float]],
-        shoulder_width: float,
-        torso_height: float,
-    ) -> bool:
-        lw = kps[KP_LEFT_WRIST]
-        rw = kps[KP_RIGHT_WRIST]
-        ls = kps[KP_LEFT_SHOULDER]
-        rs = kps[KP_RIGHT_SHOULDER]
-        lh = kps[KP_LEFT_HIP]
-        rh = kps[KP_RIGHT_HIP]
-
-        mid_hip_y = (lh[1] + rh[1]) / 2
-        if lw[1] > mid_hip_y or rw[1] > mid_hip_y:
-            return False
-
-        if torso_height > 1e-6 and abs(lw[1] - rw[1]) > 0.3 * torso_height:
-            return False
-
-        margin = cls.WRIST_X_MARGIN_RATIO
-        min_x = min(ls[0], rs[0]) - margin * abs(ls[0] - rs[0])
-        max_x = max(ls[0], rs[0]) + margin * abs(ls[0] - rs[0])
-        mid_wrist_x = (lw[0] + rw[0]) / 2
-        if not (min_x <= mid_wrist_x <= max_x):
-            return False
-
-        return True
-
-    def _update_person_clap_state(
-        self,
-        pct: PersonClapTracker,
-        norm_dist: float,
-        spatial_ok: bool,
-        is_occluded: bool,
-        person_bbox: tuple,
-        now: float,
-    ) -> ClapEvent | None:
-        alpha = self.EMA_ALPHA
-
-        if is_occluded and pct.state != ClapState.IDLE:
-            if pct.prev_velocity is not None and pct.smoothed_dist is not None:
-                pct.smoothed_dist = pct.smoothed_dist + pct.prev_velocity
-                velocity = pct.prev_velocity
-            else:
-                return None
-        else:
-            if pct.smoothed_dist is None:
-                pct.smoothed_dist = norm_dist
-            else:
-                pct.smoothed_dist = alpha * norm_dist + (1 - alpha) * pct.smoothed_dist
-            velocity = None
-            if pct.prev_smoothed_dist is not None:
-                velocity = pct.smoothed_dist - pct.prev_smoothed_dist
-
-        acceleration = None
-        if velocity is not None and pct.prev_velocity is not None:
-            acceleration = velocity - pct.prev_velocity
-
-        pct.distance_history.append(pct.smoothed_dist)
-        if len(pct.distance_history) > self.DISTANCE_HISTORY_SIZE:
-            pct.distance_history = pct.distance_history[-self.DISTANCE_HISTORY_SIZE:]
-
-        pct.prev_velocity = velocity
-        pct.prev_smoothed_dist = pct.smoothed_dist
-
-        if pct.debounce_remaining > 0:
-            pct.debounce_remaining -= 1
-
-        pct.frames_since_transition += 1
-        if pct.frames_since_transition > self.STATE_TIMEOUT_FRAMES:
-            self._reset_state(pct)
-            return None
-
-        if is_occluded and pct.state == ClapState.IDLE:
-            return None
-
-        if not spatial_ok and pct.state in (ClapState.IDLE, ClapState.APPROACHING):
-            return None
-
-        event = None
-        sd = pct.smoothed_dist
-
-        if pct.state == ClapState.IDLE:
-            if sd < self.FAR_THRESHOLD and velocity is not None and velocity < 0:
-                pct.state = ClapState.APPROACHING
-                pct.frames_since_transition = 0
-
-        elif pct.state == ClapState.APPROACHING:
-            if sd > self.FAR_THRESHOLD:
-                self._reset_state(pct)
-            elif (
-                sd < self.CONTACT_THRESHOLD
-                and velocity is not None
-                and velocity < self.APPROACH_VELOCITY_MIN
-            ):
-                pct.state = ClapState.CONTACT
-                pct.contact_frame_count = 0
-                pct.frames_since_transition = 0
-
-        elif pct.state == ClapState.CONTACT:
-            pct.contact_frame_count += 1
-            if pct.contact_frame_count > self.MAX_CONTACT_FRAMES:
-                self._reset_state(pct)
-                return None
-            if velocity is not None and velocity > 0:
-                if pct.contact_frame_count >= self.MIN_CONTACT_FRAMES:
-                    pct.state = ClapState.SEPARATING
-                    pct.frames_since_transition = 0
-                else:
-                    self._reset_state(pct)
-
-        elif pct.state == ClapState.SEPARATING:
-            if sd > self.FAR_THRESHOLD:
-                self._reset_state(pct)
-                if pct.debounce_remaining <= 0:
-                    is_sustained = self._check_periodicity(pct)
-                    cooldown = (
-                        self.DEBOUNCE_SUSTAINED_FRAMES
-                        if is_sustained
-                        else self.DEBOUNCE_SINGLE_FRAMES
-                    )
-                    pct.debounce_remaining = cooldown
-
-                    lw = pct.last_valid_kps.get(KP_LEFT_WRIST, (0, 0))
-                    rw = pct.last_valid_kps.get(KP_RIGHT_WRIST, (0, 0))
-                    center = (int((lw[0] + rw[0]) / 2), int((lw[1] + rw[1]) / 2))
-
-                    event = ClapEvent(
-                        track_id=pct.track_id,
-                        clap_center=center,
-                        person_bbox=person_bbox,
-                        is_sustained=is_sustained,
-                        timestamp=now,
-                    )
-                    log.info(
-                        "拍手検出 track_id=%d state_machine sustained=%s",
-                        pct.track_id, is_sustained,
-                    )
-            elif velocity is not None and velocity < 0:
-                pct.state = ClapState.APPROACHING
-                pct.frames_since_transition = 0
-
-        return event
-
-    def _check_periodicity(self, pct: PersonClapTracker, fps: float = 30.0) -> bool:
-        hist = pct.distance_history
-        if len(hist) < 30:
-            return False
-
-        try:
-            from scipy.signal import find_peaks
-        except ImportError:
-            return False
-
-        signal = -np.array(hist)
-        peaks, _ = find_peaks(
-            signal,
-            prominence=self.PERIODICITY_PROMINENCE,
-            distance=self.PERIODICITY_MIN_PEAK_DISTANCE,
-        )
-
-        if len(peaks) < self.PERIODICITY_MIN_PEAKS:
-            return False
-
-        intervals = np.diff(peaks)
-        mean_interval = float(np.mean(intervals))
-        if mean_interval < 1e-6:
-            return False
-
-        cv = float(np.std(intervals) / mean_interval)
-        freq = fps / mean_interval
-
-        is_sustained = (
-            cv < self.PERIODICITY_CV_MAX
-            and self.PERIODICITY_FREQ_MIN < freq < self.PERIODICITY_FREQ_MAX
-        )
-        if is_sustained:
-            pct.sustained_mode = True
-            log.info("持続的拍手検出 freq=%.1fHz CV=%.2f peaks=%d", freq, cv, len(peaks))
-        return is_sustained
-
-    @staticmethod
-    def _reset_state(pct: PersonClapTracker):
-        pct.state = ClapState.IDLE
-        pct.contact_frame_count = 0
-        pct.frames_since_transition = 0
 
     def _expire_person_clap_trackers(self):
         active_ids = {t.track_id for t in self._tracks}
         stale = [tid for tid in self._person_clap_trackers if tid not in active_ids]
         for tid in stale:
-            log.info("[track] GC PersonClapTracker track_id=%d (no longer tracked)", tid)
             del self._person_clap_trackers[tid]
 
     def close(self):
-        pass  # YOLO には close 不要
+        pass
 
 
 # -- utilities --
@@ -710,10 +393,8 @@ def draw_debug(
     out = frame.copy()
 
     _STATE_COLORS = {
-        ClapState.IDLE: (180, 180, 180),
-        ClapState.APPROACHING: (0, 200, 255),
-        ClapState.CONTACT: (0, 0, 255),
-        ClapState.SEPARATING: (0, 255, 0),
+        ClapState.FAR: (180, 180, 180),
+        ClapState.CLOSE: (0, 0, 255),
     }
 
     for track in tracks:
@@ -723,9 +404,9 @@ def draw_debug(
 
         pct = clap_trackers.get(track.track_id) if clap_trackers else None
         if pct is not None:
-            state_name = pct.state.name
-            dist_str = f"{pct.smoothed_dist:.2f}" if pct.smoothed_dist is not None else "?"
-            label += f" {state_name} d={dist_str}"
+            dist_str = f"{pct.current_dist:.0f}" if pct.current_dist is not None else "?"
+            thresh_str = f"{pct.prev_threshold:.0f}" if pct.prev_threshold is not None else "?"
+            label += f" {pct.state.name} d={dist_str}/{thresh_str}"
             color = _STATE_COLORS.get(pct.state, (0, 255, 0))
         else:
             color = (0, 255, 0)
@@ -753,12 +434,12 @@ def draw_debug(
                 if _visible(a) and _visible(b):
                     cv2.line(out, tuple(pts[a]), tuple(pts[b]), (0, 200, 255), 2)
 
-            for idx, label in [(KP_LEFT_WRIST, "L"), (KP_RIGHT_WRIST, "R")]:
+            for idx, wrist_label in [(KP_LEFT_WRIST, "L"), (KP_RIGHT_WRIST, "R")]:
                 if _visible(idx):
                     cv2.circle(out, tuple(pts[idx]), 10, (0, 60, 255), -1)
                     cv2.putText(
                         out,
-                        f"wrist {label}",
+                        f"wrist {wrist_label}",
                         (pts[idx][0] + 8, pts[idx][1]),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.45,
