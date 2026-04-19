@@ -13,8 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "ファースト肯定ペンギン - ダッシュボード",
-  description: "会場の盛り上がりをリアルタイムに可視化",
+  title: "ファースト肯定ペンギン - コメント",
+  description: "リアルタイムコメント",
 };
 
 export default function RootLayout({

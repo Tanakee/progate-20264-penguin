@@ -1,125 +1,138 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { subscribeToEvents } from "@/lib/appsync-realtime";
-import type { ClapEvent } from "@/lib/types";
-import EventFeed from "@/components/EventFeed";
-import ExcitementChart from "@/components/ExcitementChart";
-import EmotionSummary from "@/components/EmotionSummary";
-import StatsBar from "@/components/StatsBar";
-import SessionSummary from "@/components/SessionSummary";
+import {
+  subscribeToComments,
+  sendComment,
+  type Comment,
+} from "@/lib/appsync-realtime";
 
-type ViewMode = "live" | "summary";
+const COLORS = [
+  { label: "白", value: "#FFFFFF" },
+  { label: "赤", value: "#FF4444" },
+  { label: "緑", value: "#44FF44" },
+  { label: "青", value: "#4488FF" },
+  { label: "黄", value: "#FFFF44" },
+  { label: "ピンク", value: "#FF88CC" },
+];
 
 export default function Home() {
-  const [events, setEvents] = useState<ClapEvent[]>([]);
+  const [text, setText] = useState("");
+  const [color, setColor] = useState("#FFFFFF");
+  const [sending, setSending] = useState(false);
   const [connected, setConnected] = useState(false);
-  const [viewMode, setViewMode] = useState<ViewMode>("live");
-  const subRef = useRef<{ close: () => void } | null>(null);
-
-  const isConfigured = !!process.env.NEXT_PUBLIC_APPSYNC_ENDPOINT;
+  const [comments, setComments] = useState<Comment[]>([]);
+  const feedRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    if (!isConfigured) return;
-
-    const sub = subscribeToEvents(
-      (event) => {
-        if (event.id === "__summary__") {
-          setViewMode("summary");
-          return;
-        }
-        setEvents((prev) => [event, ...prev].slice(0, 100));
+    const sub = subscribeToComments(
+      (comment) => {
+        setComments((prev) => [comment, ...prev].slice(0, 100));
       },
-      () => {
-        setConnected(true);
-        console.log("AppSync Subscription connected");
-      },
-      (err) => {
-        console.error("Subscription error:", err);
-        setConnected(false);
-      }
+      () => setConnected(true),
+      (err) => console.error("Subscription error:", err)
     );
-    subRef.current = sub;
+    return () => sub.close();
+  }, []);
 
-    return () => {
-      sub.close();
-    };
-  }, [isConfigured]);
+  useEffect(() => {
+    feedRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+  }, [comments]);
 
-  if (viewMode === "summary") {
-    return (
-      <SessionSummary
-        events={events}
-        onReset={() => {
-          setEvents([]);
-          setViewMode("live");
-        }}
-      />
-    );
-  }
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!text.trim() || sending) return;
+    setSending(true);
+    try {
+      await sendComment(text.trim(), color);
+      setText("");
+    } catch (err) {
+      console.error("送信失敗:", err);
+    }
+    setSending(false);
+  };
 
   return (
-    <div className="min-h-screen bg-gray-950">
-      {/* Header */}
-      <header className="border-b border-gray-800 px-6 py-4">
-        <div className="max-w-7xl mx-auto flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <span className="text-2xl">🐧</span>
-            <h1 className="text-xl font-bold">ファースト肯定ペンギン</h1>
-          </div>
-          <div className="flex items-center gap-2">
-            <div
-              className={`w-2 h-2 rounded-full ${
-                connected ? "bg-green-500 animate-pulse" : "bg-gray-600"
+    <main className="flex flex-col items-center min-h-screen p-4 gap-6">
+      <div className="w-full max-w-md space-y-6 mt-8">
+        <div className="text-center">
+          <span className="text-5xl">🐧</span>
+          <h1 className="text-2xl font-bold mt-2">コメント</h1>
+          <div className="flex items-center justify-center gap-2 mt-2 text-sm">
+            <span
+              className={`inline-block w-2 h-2 rounded-full ${
+                connected ? "bg-green-400 animate-pulse" : "bg-gray-600"
               }`}
             />
-            <span className="text-sm text-gray-400">
-              {connected
-                ? "リアルタイム接続中"
-                : isConfigured
-                  ? "接続中..."
-                  : "デモモード"}
+            <span className="text-gray-400">
+              {connected ? "接続中" : "未接続"}
             </span>
           </div>
         </div>
-      </header>
 
-      {/* Main */}
-      <main className="max-w-7xl mx-auto px-6 py-6 space-y-6">
-        {!isConfigured && (
-          <div className="bg-yellow-900/30 border border-yellow-700/50 rounded-xl p-4 text-yellow-200 text-sm">
-            AppSync 未設定のためデモモードで表示中。
-            <code className="ml-1 text-xs bg-yellow-900/50 px-1 rounded">
-              NEXT_PUBLIC_APPSYNC_ENDPOINT
-            </code>{" "}
-            を設定してください。
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <input
+            type="text"
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            placeholder="コメントを入力..."
+            maxLength={50}
+            className="w-full px-4 py-3 bg-gray-800 border border-gray-700 rounded-xl text-white text-lg placeholder-gray-500 focus:outline-none focus:border-blue-500"
+            autoFocus
+          />
+
+          <div className="flex gap-2 justify-center">
+            {COLORS.map((c) => (
+              <button
+                key={c.value}
+                type="button"
+                onClick={() => setColor(c.value)}
+                className={`w-10 h-10 rounded-full border-2 transition-transform ${
+                  color === c.value
+                    ? "border-white scale-110"
+                    : "border-gray-600"
+                }`}
+                style={{ backgroundColor: c.value }}
+                title={c.label}
+              />
+            ))}
           </div>
-        )}
 
-        {/* Stats */}
-        <StatsBar events={events} />
+          <button
+            type="submit"
+            disabled={!text.trim() || sending}
+            className="w-full py-3 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 text-white font-bold text-lg transition-colors"
+          >
+            {sending ? "送信中..." : "送信"}
+          </button>
+        </form>
+      </div>
 
-        {/* Grid */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          {/* Event Feed */}
-          <div className="lg:col-span-2 bg-gray-900 rounded-xl border border-gray-800 p-6">
-            <h2 className="text-lg font-semibold mb-4">拍手イベント</h2>
-            <EventFeed events={events} />
-          </div>
-
-          {/* Emotion Summary */}
-          <div className="bg-gray-900 rounded-xl border border-gray-800 p-6">
-            <h2 className="text-lg font-semibold mb-4">感情分析</h2>
-            <EmotionSummary events={events} />
-          </div>
+      <div className="w-full max-w-md flex-1 min-h-0">
+        <h2 className="text-sm font-semibold text-gray-400 mb-2">
+          コメント一覧
+        </h2>
+        <div
+          ref={feedRef}
+          className="h-80 overflow-y-auto space-y-2 rounded-xl bg-gray-900 border border-gray-800 p-3"
+        >
+          {comments.length === 0 ? (
+            <p className="text-gray-600 text-center text-sm py-8">
+              まだコメントがありません
+            </p>
+          ) : (
+            comments.map((c) => (
+              <div key={c.id} className="animate-fade-in flex items-start gap-2">
+                <span
+                  className="inline-block w-3 h-3 rounded-full mt-1 shrink-0"
+                  style={{ backgroundColor: c.color || "#FFFFFF" }}
+                />
+                <span className="text-sm break-all">{c.content}</span>
+              </div>
+            ))
+          )}
         </div>
-
-        {/* Chart */}
-        <div className="bg-gray-900 rounded-xl border border-gray-800 p-6">
-          <h2 className="text-lg font-semibold mb-4">会場の盛り上がり</h2>
-          <ExcitementChart events={events} />
-        </div>
-      </main>
-    </div>
+      </div>
+    </main>
   );
 }

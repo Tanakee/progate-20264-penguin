@@ -1,72 +1,18 @@
-type ClapEvent {
-  id: ID!
-  timestamp: AWSDateTime!
-  trackId: Int!
-  imageUrl: String!
-  composedImageUrl: String
-  emotions: [Emotion!]
-  dominantEmotion: String
-  confidence: Float
-}
-
-type Emotion {
-  type: String!
-  confidence: Float!
-}
-
-type TimeseriesPoint {
-  timestamp: AWSDateTime!
-  clapCount: Int!
-  avgHappiness: Float
-}
-
 type Comment {
   id: ID!
-  text: String!
+  content: String!
   color: String
-  timestamp: AWSDateTime!
-}
-
-input CommentInput {
-  id: ID!
-  text: String!
-  color: String
-  timestamp: AWSDateTime!
-}
-
-type Query {
-  getRecentEvents(limit: Int): [ClapEvent!]!
-  getTimeseries(startTime: AWSDateTime!, endTime: AWSDateTime!): [TimeseriesPoint!]!
+  createdAt: AWSDateTime!
 }
 
 type Mutation {
-  publishClapEvent(input: ClapEventInput!): ClapEvent!
-  publishComment(input: CommentInput!): Comment!
-}
-
-input ClapEventInput {
-  id: ID!
-  timestamp: AWSDateTime!
-  trackId: Int!
-  imageUrl: String!
-  composedImageUrl: String
-  emotions: [EmotionInput!]
-  dominantEmotion: String
-  confidence: Float
-}
-
-input EmotionInput {
-  type: String!
-  confidence: Float!
+  sendComment(content: String!, color: String): Comment!
 }
 
 type Subscription {
-  onClapEvent: ClapEvent @aws_subscribe(mutations: ["publishClapEvent"])
-  onComment: Comment @aws_subscribe(mutations: ["publishComment"])
+  onComment: Comment @aws_subscribe(mutations: ["sendComment"])
 }
 
-schema {
-  query: Query
-  mutation: Mutation
-  subscription: Subscription
+type Query {
+  _empty: String
 }

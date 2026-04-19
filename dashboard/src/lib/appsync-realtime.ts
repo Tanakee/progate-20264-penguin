@@ -1,22 +1,23 @@
-import type { ClapEvent } from "./types";
-
 const APPSYNC_ENDPOINT = process.env.NEXT_PUBLIC_APPSYNC_ENDPOINT || "";
 const APPSYNC_API_KEY = process.env.NEXT_PUBLIC_APPSYNC_API_KEY || "";
 
 const SUBSCRIPTION_QUERY = JSON.stringify({
-  query: `subscription OnClapEvent {
-    onClapEvent {
+  query: `subscription OnComment {
+    onComment {
       id
-      timestamp
-      trackId
-      imageUrl
-      composedImageUrl
-      emotions { type confidence }
-      dominantEmotion
-      confidence
+      content
+      color
+      createdAt
     }
   }`,
 });
+
+export interface Comment {
+  id: string;
+  content: string;
+  color: string | null;
+  createdAt: string;
+}
 
 function getRealtimeUrl(): string {
   return APPSYNC_ENDPOINT.replace("https://", "wss://").replace(
@@ -34,8 +35,8 @@ function encodeHeader(): string {
   );
 }
 
-export function subscribeToEvents(
-  onEvent: (event: ClapEvent) => void,
+export function subscribeToComments(
+  onComment: (comment: Comment) => void,
   onConnect: () => void,
   onError: (err: unknown) => void
 ): { close: () => void } {
@@ -56,7 +57,6 @@ export function subscribeToEvents(
 
   ws.onmessage = (msg) => {
     const data = JSON.parse(msg.data);
-    console.log("[WS] received:", data.type, data);
 
     switch (data.type) {
       case "connection_ack": {
@@ -84,17 +84,14 @@ export function subscribeToEvents(
         break;
 
       case "data": {
-        console.log("[WS] data payload:", JSON.stringify(data.payload, null, 2));
-        const event = data.payload?.data?.onClapEvent;
-        if (event) {
-          onEvent(event);
+        const comment = data.payload?.data?.onComment;
+        if (comment) {
+          onComment(comment);
         }
         break;
       }
 
       case "error":
-        console.error("AppSync WS error:", JSON.stringify(data.payload, null, 2));
-        console.error("AppSync WS error full msg:", JSON.stringify(data, null, 2));
         onError(data.payload);
         break;
 
@@ -103,11 +100,7 @@ export function subscribeToEvents(
     }
   };
 
-  ws.onerror = (err) => {
-    console.error("WebSocket error:", err);
-    onError(err);
-  };
-
+  ws.onerror = (err) => onError(err);
   ws.onclose = () => {};
 
   return {
@@ -118,4 +111,23 @@ export function subscribeToEvents(
       ws.close();
     },
   };
+}
+
+export async function sendComment(content: string, color: string) {
+  const res = await fetch(APPSYNC_ENDPOINT, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": APPSYNC_API_KEY,
+    },
+    body: JSON.stringify({
+      query: `mutation SendComment($content: String!, $color: String) {
+        sendComment(content: $content, color: $color) {
+          id content color createdAt
+        }
+      }`,
+      variables: { content, color },
+    }),
+  });
+  return res.json();
 }

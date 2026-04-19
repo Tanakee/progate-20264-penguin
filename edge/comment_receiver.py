@@ -19,9 +19,9 @@ SUBSCRIPTION_QUERY = json.dumps({
     "query": """subscription OnComment {
         onComment {
             id
-            text
+            content
             color
-            timestamp
+            createdAt
         }
     }"""
 })
@@ -144,7 +144,7 @@ class CommentReceiver:
         y_slot = random.randint(30, 680)
         speed = random.uniform(7.0, 12.0)
         comment = Comment(
-            text=data.get("text", ""),
+            text=data.get("content", ""),
             color=data.get("color", "#FFFFFF"),
             x=float(self._frame_width + 50),
             y=y_slot,
