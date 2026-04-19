@@ -72,7 +72,7 @@ def _load_config() -> dict:
         sys.exit("[ERROR] CLAP_THRESHOLD_RMS は整数で指定してください")
 
     try:
-        ar_display_sec = int(os.getenv("AR_DISPLAY_DURATION_SEC", 10))
+        ar_display_sec = int(os.getenv("AR_DISPLAY_DURATION_SEC", 1))
     except ValueError:
         sys.exit("[ERROR] AR_DISPLAY_DURATION_SEC は整数で指定してください")
 
@@ -83,6 +83,9 @@ def _load_config() -> dict:
         "ar_display_sec": ar_display_sec,
         "asset_path": os.getenv(
             "ASSET_PATH", str(Path(__file__).parent.parent / "assets" / "penguin.png")
+        ),
+        "first_asset_path": os.getenv(
+            "FIRST_ASSET_PATH", str(Path(__file__).parent.parent / "assets" / "penguin2.png")
         ),
         "s3_bucket": os.getenv("S3_BUCKET_NAME", ""),
         "s3_raw_prefix": os.getenv("S3_RAW_PREFIX", "raw/"),
@@ -245,6 +248,7 @@ class _PenguinState:
     expire_time: float
     last_bbox: tuple[int, int, int, int]
     last_body_bbox: tuple[int, int, int, int] | None = None
+    is_first: bool = False
 
 
 def main():
@@ -262,6 +266,7 @@ def main():
 
     try:
         overlay = AROverlay(cfg["asset_path"])
+        first_overlay = AROverlay(cfg["first_asset_path"])
     except (FileNotFoundError, ValueError) as e:
         sys.exit(f"[ERROR] {e}")
 
@@ -274,8 +279,12 @@ def main():
     comment_receiver = CommentReceiver(cfg["appsync_endpoint"], cfg["appsync_api_key"], frame_width=actual_w)
     comment_receiver.start()
 
-    vcam = pyvirtualcam.Camera(width=actual_w, height=actual_h, fps=30)
-    log.info("仮想カメラ起動: %s (%dx%d)", vcam.device, actual_w, actual_h)
+    try:
+        vcam = pyvirtualcam.Camera(width=actual_w, height=actual_h, fps=30)
+        log.info("仮想カメラ起動: %s (%dx%d)", vcam.device, actual_w, actual_h)
+    except RuntimeError:
+        vcam = None
+        log.warning("仮想カメラなしで起動（OBS未起動）")
 
     penguin_states: dict[int, _PenguinState] = {}
     camera_fail_count = 0
@@ -335,14 +344,18 @@ def main():
                         log.info("拍手検出 (映像のみ) track_id=%d", vt.track_id)
 
             if targets:
-                for target in targets:
+                no_penguin_active = len(penguin_states) == 0
+                for i, target in enumerate(targets):
+                    is_first = no_penguin_active and i == 0
                     penguin_states[target.track_id] = _PenguinState(
                         expire_time=now + cfg["ar_display_sec"],
                         last_bbox=target.bbox,
                         last_body_bbox=target.body_bbox,
+                        is_first=is_first,
                     )
                     log.info(
-                        "ファーストペンギン! track_id=%d center=%s",
+                        "%s track_id=%d center=%s",
+                        "ファーストペンギン!" if is_first else "ペンギン",
                         target.track_id,
                         target.center,
                     )
@@ -395,7 +408,8 @@ def main():
                 oh = int(h * AR_OVERLAY_SCALE_Y)
                 ox = x - (ow - w) // 2
                 oy = y - (oh - h) // 2
-                composed = overlay.apply(composed, ox, oy, ow, oh)
+                active_overlay = first_overlay if state.is_first else overlay
+                composed = active_overlay.apply(composed, ox, oy, ow, oh)
 
             if upload_composed and s3_client:
                 executor.submit(
@@ -418,13 +432,19 @@ def main():
             comment_receiver.update_comments(alive)
 
             debug_frame = draw_debug(composed, tracks, yolo_result, tracker._person_clap_trackers)
-            vcam.send(cv2.cvtColor(debug_frame, cv2.COLOR_BGR2RGB))
+            if vcam is not None:
+                vcam.send(cv2.cvtColor(debug_frame, cv2.COLOR_BGR2RGB))
             cv2.imshow("First Penguin AR", debug_frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
                 break
+            if key == ord("r"):
+                penguin_states.clear()
+                log.info("セクションリセット: 次の拍手者がファーストペンギンになります")
 
     finally:
-        vcam.close()
+        if vcam is not None:
+            vcam.close()
         notifier.send_summary()
         comment_receiver.stop()
         detector.stop()
