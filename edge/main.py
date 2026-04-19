@@ -308,9 +308,11 @@ def main():
                 continue
             camera_fail_count = 0
 
+            t_start = time.monotonic()
             raw_frame = frame.copy()
             tracks, yolo_result = tracker.process(frame)
             now = time.monotonic()
+            process_ms = (now - t_start) * 1000
 
             # -- clap detection (audio + visual) --
             upload_composed = False
@@ -343,8 +345,12 @@ def main():
                         targets.append(vt)
                         log.info("拍手検出 (映像のみ) track_id=%d", vt.track_id)
 
+            # ファーストペンギンは音声確認必須
+            no_penguin_active = len(penguin_states) == 0
+            if no_penguin_active and not audio_triggered:
+                targets = []
+
             if targets:
-                no_penguin_active = len(penguin_states) == 0
                 for i, target in enumerate(targets):
                     is_first = no_penguin_active and i == 0
                     penguin_states[target.track_id] = _PenguinState(

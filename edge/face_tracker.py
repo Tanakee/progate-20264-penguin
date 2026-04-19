@@ -81,6 +81,7 @@ class FaceTracker:
 
     # -- clap detection v3 --
     CLOSE_RATIO = 0.35
+    APPROACH_SPEED_RATIO = 0.10
     DEBOUNCE_SEC = 1.0
 
     def __init__(self, yolo_model: str = "yolov8s-pose.pt"):
@@ -305,11 +306,15 @@ class FaceTracker:
 
             pct.current_dist = dist
 
+            speed = (pct.prev_dist - dist) if pct.prev_dist is not None else 0.0
+            min_speed = bbox_width * self.APPROACH_SPEED_RATIO
+
             crossed = (
                 pct.prev_dist is not None
                 and pct.prev_threshold is not None
                 and pct.prev_dist >= pct.prev_threshold
                 and dist < threshold
+                and speed >= min_speed
             )
 
             pct.state = ClapState.CLOSE if dist < threshold else ClapState.FAR
@@ -325,7 +330,7 @@ class FaceTracker:
                     person_bbox=person_bbox,
                     timestamp=now,
                 ))
-                log.info("拍手検出 track_id=%d dist=%.0f thresh=%.0f", track_id, dist, threshold)
+                log.info("拍手検出 track_id=%d dist=%.0f thresh=%.0f speed=%.0f min_speed=%.0f", track_id, dist, threshold, speed, min_speed)
 
         return events
 
