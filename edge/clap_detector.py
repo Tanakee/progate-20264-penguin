@@ -28,14 +28,14 @@ class ClapDetector:
       - クールダウンは消費側が acknowledge() で開始（デフォルト 0.4秒）
     """
 
-    CALIBRATION_MULTIPLIER = 3.0
+    CALIBRATION_MULTIPLIER = 2.0
     CALIBRATION_MIN_THRESHOLD = 800
 
     def __init__(
         self,
-        threshold_rms: int = 2000,
-        cooldown_sec: float = 0.4,
-        spectral_ratio_threshold: float = 0.3,
+        threshold_rms: int = 1200,
+        cooldown_sec: float = 0.25,
+        spectral_ratio_threshold: float = 0.15,
     ):
         self._threshold = threshold_rms
         self._cooldown_sec = cooldown_sec

@@ -308,14 +308,20 @@ def main():
             targets: list[TrackedFace] = []
             audio_triggered = detector.consume()
 
-            # 音声トリガー時: ジェスチャー確認付きで検出
+            # 音声トリガー時: ジェスチャー確認付きで検出、確認できなければ候補割り当て
             if audio_triggered:
                 targets = tracker.find_clapping_faces(frame.shape, tracks)
                 if targets:
-                    detector.acknowledge()
                     log.info("拍手検出 (音声+映像)")
                 else:
-                    log.info("拍手音を検知しましたが映像で確認できませんでした")
+                    candidate = tracker.find_best_audio_candidate(tracks)
+                    if candidate:
+                        targets = [candidate]
+                        log.info("拍手検出 (音声+候補割り当て) track_id=%d", candidate.track_id)
+                    else:
+                        log.info("拍手音を検知しましたが対象者を特定できませんでした")
+                if targets:
+                    detector.acknowledge()
 
             # 映像のみ検出: 音声で見つからなかった人も含めて追加
             already = {t.track_id for t in targets}

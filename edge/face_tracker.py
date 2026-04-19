@@ -86,24 +86,24 @@ class FaceTracker:
     HEAD_REGION_RATIO = 0.15
     FACE_BBOX_MARGIN_RATIO = 0.03
     NOSE_CONF_THRESHOLD = 0.3
-    KP_CONF_THRESHOLD = 0.3
+    KP_CONF_THRESHOLD = 0.15
 
     # -- Layer 1: normalized distance + EMA --
     EMA_ALPHA = 0.35
 
     # -- Layer 2: state machine --
-    FAR_THRESHOLD = 1.3
-    CONTACT_THRESHOLD = 0.4
-    APPROACH_VELOCITY_MIN = -0.05
-    MIN_CONTACT_FRAMES = 2
+    FAR_THRESHOLD = 1.0
+    CONTACT_THRESHOLD = 0.6
+    APPROACH_VELOCITY_MIN = -0.01
+    MIN_CONTACT_FRAMES = 1
     MAX_CONTACT_FRAMES = 8
-    STATE_TIMEOUT_FRAMES = 15
+    STATE_TIMEOUT_FRAMES = 25
     WRIST_Y_DIFF_RATIO = 0.3
-    WRIST_X_MARGIN_RATIO = 0.2
-    OCCLUSION_GRACE_FRAMES = 5
+    WRIST_X_MARGIN_RATIO = 0.5
+    OCCLUSION_GRACE_FRAMES = 20
 
     # -- debounce --
-    DEBOUNCE_SINGLE_FRAMES = 18
+    DEBOUNCE_SINGLE_FRAMES = 12
     DEBOUNCE_SUSTAINED_FRAMES = 9
 
     # -- Layer 3: periodicity --
@@ -196,6 +196,40 @@ class FaceTracker:
 
         result.sort(key=lambda t: _dist(t.center, frame_center))
         return result
+
+    def find_best_audio_candidate(
+        self,
+        tracks: list[TrackedFace],
+    ) -> TrackedFace | None:
+        """音声トリガー時に映像で確定できなかった場合、最有力候補を返す。"""
+        if not tracks:
+            return None
+
+        active_states = (ClapState.APPROACHING, ClapState.CONTACT, ClapState.SEPARATING)
+        best: TrackedFace | None = None
+        best_score = -1
+
+        for t in tracks:
+            pct = self._person_clap_trackers.get(t.track_id)
+            score = 0
+            if pct is not None:
+                if pct.state in active_states:
+                    score = 30
+                elif pct.occluded_frames > 0:
+                    score = 20
+                elif pct.state == ClapState.IDLE and pct.smoothed_dist is not None:
+                    score = 10
+            if score > best_score:
+                best_score = score
+                best = t
+
+        if best is not None and best_score > 0:
+            return best
+
+        if len(tracks) == 1:
+            return tracks[0]
+
+        return None
 
     @property
     def gesture_buffer_size(self) -> int:
@@ -337,7 +371,8 @@ class FaceTracker:
             resolved = self._resolve_keypoints(pct, person_kps, person_conf, required_kps)
             if resolved is None:
                 log.debug("[clap-diag] track=%d: keypoints rejected (occluded=%d)", track_id, pct.occluded_frames)
-                self._reset_state(pct)
+                if pct.state == ClapState.IDLE:
+                    self._reset_state(pct)
                 continue
 
             ls = resolved[KP_LEFT_SHOULDER]
@@ -439,15 +474,14 @@ class FaceTracker:
             pct.occluded_frames += 1
             if pct.occluded_frames > self.OCCLUSION_GRACE_FRAMES:
                 return None
-            if pct.state == ClapState.CONTACT:
-                return None
         else:
             pct.occluded_frames = 0
 
         return resolved
 
-    @staticmethod
+    @classmethod
     def _is_valid_clap_position(
+        cls,
         kps: dict[int, tuple[float, float]],
         shoulder_width: float,
         torso_height: float,
@@ -466,8 +500,9 @@ class FaceTracker:
         if torso_height > 1e-6 and abs(lw[1] - rw[1]) > 0.3 * torso_height:
             return False
 
-        min_x = min(ls[0], rs[0]) - 0.2 * abs(ls[0] - rs[0])
-        max_x = max(ls[0], rs[0]) + 0.2 * abs(ls[0] - rs[0])
+        margin = cls.WRIST_X_MARGIN_RATIO
+        min_x = min(ls[0], rs[0]) - margin * abs(ls[0] - rs[0])
+        max_x = max(ls[0], rs[0]) + margin * abs(ls[0] - rs[0])
         mid_wrist_x = (lw[0] + rw[0]) / 2
         if not (min_x <= mid_wrist_x <= max_x):
             return False
@@ -484,14 +519,21 @@ class FaceTracker:
         now: float,
     ) -> ClapEvent | None:
         alpha = self.EMA_ALPHA
-        if pct.smoothed_dist is None:
-            pct.smoothed_dist = norm_dist
-        else:
-            pct.smoothed_dist = alpha * norm_dist + (1 - alpha) * pct.smoothed_dist
 
-        velocity = None
-        if pct.prev_smoothed_dist is not None:
-            velocity = pct.smoothed_dist - pct.prev_smoothed_dist
+        if is_occluded and pct.state != ClapState.IDLE:
+            if pct.prev_velocity is not None and pct.smoothed_dist is not None:
+                pct.smoothed_dist = pct.smoothed_dist + pct.prev_velocity
+                velocity = pct.prev_velocity
+            else:
+                return None
+        else:
+            if pct.smoothed_dist is None:
+                pct.smoothed_dist = norm_dist
+            else:
+                pct.smoothed_dist = alpha * norm_dist + (1 - alpha) * pct.smoothed_dist
+            velocity = None
+            if pct.prev_smoothed_dist is not None:
+                velocity = pct.smoothed_dist - pct.prev_smoothed_dist
 
         acceleration = None
         if velocity is not None and pct.prev_velocity is not None:
@@ -512,7 +554,7 @@ class FaceTracker:
             self._reset_state(pct)
             return None
 
-        if is_occluded:
+        if is_occluded and pct.state == ClapState.IDLE:
             return None
 
         if not spatial_ok and pct.state in (ClapState.IDLE, ClapState.APPROACHING):
