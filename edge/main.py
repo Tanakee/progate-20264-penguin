@@ -5,7 +5,7 @@
     cd edge
     python main.py
 
-カメラ・マイクが必要なため、Docker コンテナ内ではなくネイティブで実行すること。
+カメラが必要なため、Docker コンテナ内ではなくネイティブで実行すること。
 """
 
 import logging
@@ -20,15 +20,17 @@ from pathlib import Path
 import boto3
 import cv2
 import numpy as np
-import pyvirtualcam
+try:
+    import pyvirtualcam
+except ImportError:
+    pyvirtualcam = None
 from PIL import ImageFont, ImageDraw, Image
 from dotenv import load_dotenv
 
 from appsync_notifier import AppSyncNotifier
 from ar_overlay import AROverlay
-from clap_detector import ClapDetector
 from comment_receiver import CommentReceiver
-from face_tracker import FaceTracker, TrackedFace, draw_debug
+from face_tracker import FaceTracker, TrackedPerson, draw_debug
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
@@ -60,17 +62,6 @@ def _load_config() -> dict:
     except ValueError:
         sys.exit("[ERROR] CAMERA_INDEX は整数で指定してください")
 
-    mic_raw = os.getenv("MIC_INDEX")
-    try:
-        mic_index = int(mic_raw) if mic_raw else None
-    except ValueError:
-        sys.exit("[ERROR] MIC_INDEX は整数で指定してください")
-
-    try:
-        clap_threshold = int(os.getenv("CLAP_THRESHOLD_RMS", 2000))
-    except ValueError:
-        sys.exit("[ERROR] CLAP_THRESHOLD_RMS は整数で指定してください")
-
     try:
         ar_display_sec = int(os.getenv("AR_DISPLAY_DURATION_SEC", 10))
     except ValueError:
@@ -78,8 +69,6 @@ def _load_config() -> dict:
 
     return {
         "camera_index": camera_index,
-        "mic_index": mic_index,
-        "clap_threshold": clap_threshold,
         "ar_display_sec": ar_display_sec,
         "asset_path": os.getenv(
             "ASSET_PATH", str(Path(__file__).parent.parent / "assets" / "penguin.png")
@@ -266,7 +255,6 @@ def main():
         sys.exit(f"[ERROR] {e}")
 
     tracker = FaceTracker()
-    detector = ClapDetector(threshold_rms=cfg["clap_threshold"])
     executor = ThreadPoolExecutor(max_workers=2)
 
     s3_client = _create_s3_client(cfg["aws_endpoint_url"]) if cfg["s3_bucket"] else None
@@ -274,18 +262,18 @@ def main():
     comment_receiver = CommentReceiver(cfg["appsync_endpoint"], cfg["appsync_api_key"], frame_width=actual_w)
     comment_receiver.start()
 
-    vcam = pyvirtualcam.Camera(width=actual_w, height=actual_h, fps=30)
-    log.info("仮想カメラ起動: %s (%dx%d)", vcam.device, actual_w, actual_h)
+    vcam = None
+    if pyvirtualcam is not None:
+        try:
+            vcam = pyvirtualcam.Camera(width=actual_w, height=actual_h, fps=30)
+            log.info("仮想カメラ起動: %s (%dx%d)", vcam.device, actual_w, actual_h)
+        except RuntimeError as e:
+            log.warning("仮想カメラ起動失敗（OBS未設定）: %s — 仮想カメラなしで続行", e)
 
     penguin_states: dict[int, _PenguinState] = {}
     camera_fail_count = 0
 
-    mic_ok = detector.start(device_index=cfg["mic_index"])
-    if mic_ok:
-        detector.calibrate(duration_sec=3.0)
-        log.info("'q' キーで終了。拍手を検知するとペンギンが出現します。")
-    else:
-        log.info("'q' キーで終了。マイクなしで起動しました。")
+    log.info("'q' キーで終了。拍手を検知するとペンギンが出現します。")
 
     try:
         while True:
@@ -303,42 +291,15 @@ def main():
             tracks, yolo_result = tracker.process(frame)
             now = time.monotonic()
 
-            # -- clap detection (audio + visual) --
+            # -- visual clap detection --
             upload_composed = False
-            targets: list[TrackedFace] = []
-            audio_triggered = detector.consume()
-
-            # 音声トリガー時: ジェスチャー確認付きで検出、確認できなければ候補割り当て
-            if audio_triggered:
-                targets = tracker.find_clapping_faces(frame.shape, tracks)
-                if targets:
-                    log.info("拍手検出 (音声+映像)")
-                else:
-                    candidate = tracker.find_best_audio_candidate(tracks)
-                    if candidate:
-                        targets = [candidate]
-                        log.info("拍手検出 (音声+候補割り当て) track_id=%d", candidate.track_id)
-                    else:
-                        log.info("拍手音を検知しましたが対象者を特定できませんでした")
-                if targets:
-                    detector.acknowledge()
-
-            # 映像のみ検出: 音声で見つからなかった人も含めて追加
-            already = {t.track_id for t in targets}
-            visual_targets = tracker.find_visual_clappers(
-                frame.shape, tracks, exclude_ids=already
-            )
-            if visual_targets:
-                for vt in visual_targets:
-                    if vt.track_id not in already:
-                        targets.append(vt)
-                        log.info("拍手検出 (映像のみ) track_id=%d", vt.track_id)
+            targets = tracker.find_clapping_persons(frame.shape, tracks)
 
             if targets:
                 for target in targets:
                     penguin_states[target.track_id] = _PenguinState(
                         expire_time=now + cfg["ar_display_sec"],
-                        last_bbox=target.bbox,
+                        last_bbox=target.face_bbox,
                         last_body_bbox=target.body_bbox,
                     )
                     log.info(
@@ -371,20 +332,14 @@ def main():
             # -- update last_bbox + extend if still clapping --
             current_clappers = {t.track_id for t in targets}
             for tid, state in penguin_states.items():
-                face = next((t for t in tracks if t.track_id == tid), None)
-                if face:
-                    state.last_bbox = face.bbox
-                    state.last_body_bbox = face.body_bbox
+                person = next((t for t in tracks if t.track_id == tid), None)
+                if person:
+                    state.last_bbox = person.face_bbox
+                    state.last_body_bbox = person.body_bbox
                 if tid in current_clappers:
                     state.expire_time = now + cfg["ar_display_sec"]
 
-            # -- post-display cancellation (arm-crossing via state machine) --
-            cancel_ids = [tid for tid in penguin_states if tracker.is_arm_crossing(tid)]
-            for tid in cancel_ids:
-                log.info("腕組み判定で取り消し track_id=%d", tid)
-                del penguin_states[tid]
-
-            # -- AR overlay (uses body_bbox for full-body penguin) --
+            # -- AR overlay --
             composed = frame
             for state in penguin_states.values():
                 if state.last_body_bbox:
@@ -417,17 +372,18 @@ def main():
                     alive.append(c)
             comment_receiver.update_comments(alive)
 
-            debug_frame = draw_debug(composed, tracks, yolo_result, tracker._person_clap_trackers)
-            vcam.send(cv2.cvtColor(debug_frame, cv2.COLOR_BGR2RGB))
+            debug_frame = draw_debug(composed, tracks, yolo_result, tracker.clap_trackers)
+            if vcam is not None:
+                vcam.send(cv2.cvtColor(debug_frame, cv2.COLOR_BGR2RGB))
             cv2.imshow("First Penguin AR", debug_frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
     finally:
-        vcam.close()
+        if vcam is not None:
+            vcam.close()
         notifier.send_summary()
         comment_receiver.stop()
-        detector.stop()
         tracker.close()
         cap.release()
         cv2.destroyAllWindows()
