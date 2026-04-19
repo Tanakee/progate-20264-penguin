@@ -10,5 +10,8 @@ numpy==1.26.4
 boto3==1.34.144
 botocore==1.34.144
 
+# WebSocket (コメント受信)
+websocket-client>=1.6.0
+
 # 環境変数管理
 python-dotenv==1.0.1

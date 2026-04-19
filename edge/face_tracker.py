@@ -44,6 +44,9 @@ class _GestureEntry:
     timestamp: float
     clap_center: tuple[int, int]
     person_bbox: tuple[float, float, float, float]  # x1, y1, x2, y2
+    wrist_dist: float = 0.0
+    left_wrist: tuple[float, float] = (0.0, 0.0)
+    right_wrist: tuple[float, float] = (0.0, 0.0)
 
 
 class FaceTracker:
@@ -54,12 +57,13 @@ class FaceTracker:
 
     TRACK_TIMEOUT_SEC = 1.5
     IOU_THRESHOLD = 0.3
-    CLAP_DIST_RATIO = 0.15
+    CLAP_DIST_RATIO = 0.45
     KP_CONF_THRESHOLD = 0.3
     CLAP_CENTER_DEDUP_RATIO = 0.1
-    GESTURE_BUFFER_SEC = 2.0
-    CLAP_CONFIRM_MIN = 1
+    GESTURE_BUFFER_SEC = 0.5
+    CLAP_CONFIRM_MIN = 3
     CLAP_GROUP_DIST_RATIO = 0.15
+    WRIST_SPEED_THRESHOLD = 150.0
     HEAD_REGION_RATIO = 0.15
     FACE_BBOX_MARGIN_RATIO = 0.03
 
@@ -111,6 +115,34 @@ class FaceTracker:
                 used_ids.add(face.track_id)
             else:
                 log.debug("人物BBox内に顔が見つかりませんでした")
+
+        result.sort(key=lambda t: _dist(t.center, frame_center))
+        return result
+
+    def find_visual_clappers(
+        self,
+        frame_shape: tuple,
+        tracks: list[TrackedFace],
+        exclude_ids: set[int] | None = None,
+    ) -> list[TrackedFace]:
+        """音声トリガーなしで、映像のジェスチャーバッファだけで拍手者を返す。"""
+        if not tracks:
+            return []
+
+        h, w = frame_shape[:2]
+        confirmed = self._get_confirmed_clap_gestures(w)
+        if not confirmed:
+            return []
+
+        frame_center = (w / 2, h / 2)
+        result: list[TrackedFace] = []
+        used_ids: set[int] = set(exclude_ids or set())
+
+        for gesture in confirmed:
+            face = self._find_face_in_person_bbox(gesture.person_bbox, tracks, used_ids)
+            if face:
+                result.append(face)
+                used_ids.add(face.track_id)
 
         result.sort(key=lambda t: _dist(t.center, frame_center))
         return result
@@ -220,8 +252,21 @@ class FaceTracker:
             if (lw[0] == 0 and lw[1] == 0) or (rw[0] == 0 and rw[1] == 0):
                 continue
 
+            if boxes is not None and i < len(boxes.xyxy):
+                person_bbox = tuple(boxes.xyxy[i].cpu().numpy().tolist())
+                person_w = person_bbox[2] - person_bbox[0]
+            else:
+                person_bbox = (
+                    float(min(lw[0], rw[0]) - w * 0.05),
+                    0,
+                    float(max(lw[0], rw[0]) + w * 0.05),
+                    float(h),
+                )
+                person_w = person_bbox[2] - person_bbox[0]
+
             dist = float(np.linalg.norm(lw - rw))
-            if dist >= w * self.CLAP_DIST_RATIO:
+            clap_threshold = person_w * self.CLAP_DIST_RATIO
+            if dist >= clap_threshold:
                 continue
 
             center = (int((lw[0] + rw[0]) / 2), int((lw[1] + rw[1]) / 2))
@@ -233,18 +278,13 @@ class FaceTracker:
                 continue
             seen_centers.append(center)
 
-            if boxes is not None and i < len(boxes.xyxy):
-                person_bbox = tuple(boxes.xyxy[i].cpu().numpy().tolist())
-            else:
-                person_bbox = (
-                    center[0] - w * 0.1,
-                    0,
-                    center[0] + w * 0.1,
-                    float(h),
-                )
-
             entries.append(
-                _GestureEntry(timestamp=now, clap_center=center, person_bbox=person_bbox)
+                _GestureEntry(
+                    timestamp=now, clap_center=center, person_bbox=person_bbox,
+                    wrist_dist=dist,
+                    left_wrist=(float(lw[0]), float(lw[1])),
+                    right_wrist=(float(rw[0]), float(rw[1])),
+                )
             )
 
         return entries
@@ -274,9 +314,26 @@ class FaceTracker:
 
         confirmed: list[_GestureEntry] = []
         for group in groups:
-            if len(group) >= self.CLAP_CONFIRM_MIN:
-                log.info("拍手確定 (%dフレーム検出)", len(group))
-                confirmed.append(group[-1])
+            if len(group) < self.CLAP_CONFIRM_MIN:
+                continue
+
+            max_speed = 0.0
+            for i in range(1, len(group)):
+                dt = group[i].timestamp - group[i - 1].timestamp
+                if dt <= 0:
+                    continue
+                for wrist in ("left_wrist", "right_wrist"):
+                    prev = np.array(getattr(group[i - 1], wrist))
+                    curr = np.array(getattr(group[i], wrist))
+                    speed = float(np.linalg.norm(curr - prev)) / dt
+                    max_speed = max(max_speed, speed)
+
+            if max_speed < self.WRIST_SPEED_THRESHOLD:
+                log.debug("低速ポーズとして棄却 (速度=%.0f px/s < 閾値=%.0f)", max_speed, self.WRIST_SPEED_THRESHOLD)
+                continue
+
+            log.info("拍手確定 (%dフレーム, 手首速度=%.0f px/s)", len(group), max_speed)
+            confirmed.append(group[-1])
 
         return confirmed
 
